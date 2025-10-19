@@ -1,0 +1,72 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ~/.ollama:/root/.ollama
+    healthcheck:
+      # robust: succeeds only when the daemon is accepting requests
+      test: [ "CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1" ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+    networks: [rag-net]
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fastapi-backend
+    command: uvicorn app:app --host 0.0.0.0 --port 4000 --reload
+    ports:
+      - "4000:4000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TRANSFORMERS_NO_TF=1
+      - TOKENIZERS_PARALLELISM=false
+      # ✅ point to the ollama SERVICE, not 127.0.0.1
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 120s   # allow time for first embeddings / model load
+    volumes:
+      - .:/app
+    networks: [rag-net]
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui
+    ports:
+      - "3000:8080"
+    environment:
+      - WEBUI_AUTH=false
+      - TRANSFORMERS_NO_TF=1
+      - TOKENIZERS_PARALLELISM=false
+      # WebUI will call your FastAPI as an OpenAI provider
+      - OPENAI_API_BASE_URL=http://fastapi:4000/v1
+      - OPENAI_API_KEY=sk-anything
+      # (optional) also expose direct Ollama to WebUI:
+      - OLLAMA_BASE_URL=http://ollama:11434
+    depends_on:
+      fastapi:
+        condition: service_healthy
+    volumes:
+      - openwebui-data:/app/backend/data
+    networks: [rag-net]
+
+networks:
+  rag-net:
+
+volumes:
+  openwebui-data:
