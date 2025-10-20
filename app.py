@@ -10,6 +10,7 @@ _os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
 import os, glob
 from pathlib import Path
 from typing import List, Tuple, Dict
+import json
 
 import numpy as np
 from fastapi import FastAPI, Query
@@ -19,6 +20,10 @@ from sentence_transformers import SentenceTransformer
 from fastapi import HTTPException
 import asyncio
 from crewai import Agent, Task, Crew, Process  # CrewAI (no crewai_tools)
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from sqlalchemy import create_engine
+from sqlalchemy.sql import text
 
 load_dotenv()
 
@@ -26,14 +31,25 @@ load_dotenv()
 ROOT_DIR = Path(__file__).parent.resolve()
 DATA_DIR = ROOT_DIR / "data"
 
-# ---------- In-memory Vector Store ----------
+# ---------- PostgreSQL Vector Store ----------
 class VectorStore:
-    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
+    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", database_url: str = None):
         # CPU for stability on macOS; change to device="cuda" if you have GPU
         self.embedder = SentenceTransformer(model_name, device="cpu")
-        self.chunks: List[str] = []
-        self.metadatas: List[Dict] = []
-        self.embeddings: np.ndarray | None = None
+        self.database_url = database_url or os.getenv("DATABASE_URL", "postgresql://raguser:ragpass@localhost:5432/ragdb")
+        self.engine = create_engine(self.database_url)
+        self._init_database()
+
+    def _init_database(self):
+        """Initialize database connection and ensure tables exist"""
+        try:
+            with self.engine.connect() as conn:
+                # Test connection
+                conn.execute(text("SELECT 1"))
+                print("[VectorStore] Connected to PostgreSQL database")
+        except Exception as e:
+            print(f"[VectorStore] Database connection failed: {e}")
+            raise
 
     @staticmethod
     def _chunk(text: str, size: int = 500, overlap: int = 80) -> List[str]:
@@ -75,20 +91,98 @@ class VectorStore:
                 metas.append({"source": p.name, "chunk": idx, "path": str(p)})
 
         if not texts:
-            self.chunks, self.metadatas, self.embeddings = [], [], None
             return 0, [str(p) for p in files]
 
-        self.chunks, self.metadatas = texts, metas
-        self.embeddings = self._encode(texts)
+        # Clear existing data for this folder
+        self._clear_existing_data(folder)
+
+        # Generate embeddings
+        embeddings = self._encode(texts)
+        
+        # Store in PostgreSQL
+        self._store_embeddings(texts, metas, embeddings)
+        
         return len(texts), [str(p) for p in files]
 
+    def _clear_existing_data(self, folder: Path):
+        """Clear existing data for the given folder"""
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(
+                    text("DELETE FROM documents WHERE metadata->>'path' LIKE :pattern"),
+                    {"pattern": f"{folder}%"}
+                )
+                conn.commit()
+        except Exception as e:
+            print(f"[VectorStore] Error clearing existing data: {e}")
+
+    def _store_embeddings(self, texts: List[str], metas: List[Dict], embeddings: np.ndarray):
+        """Store texts, metadata, and embeddings in PostgreSQL"""
+        try:
+            with self.engine.connect() as conn:
+                for i, (text_content, meta, embedding) in enumerate(zip(texts, metas, embeddings)):
+                    conn.execute(
+                        text("""
+                            INSERT INTO documents (content, embedding, metadata, source, chunk_index)
+                            VALUES (:content, :embedding, :metadata, :source, :chunk_index)
+                        """),
+                        {
+                            "content": text_content,
+                            "embedding": embedding.tolist(),  # Convert numpy array to list
+                            "metadata": json.dumps(meta),
+                            "source": meta.get("source", ""),
+                            "chunk_index": meta.get("chunk", 0)
+                        }
+                    )
+                conn.commit()
+                print(f"[VectorStore] Stored {len(texts)} documents in PostgreSQL")
+        except Exception as e:
+            print(f"[VectorStore] Error storing embeddings: {e}")
+            raise
+
     def query(self, q: str, k: int = 5) -> List[Tuple[str, Dict, float]]:
-        if self.embeddings is None or not self.chunks:
+        """Query the vector database using cosine similarity"""
+        try:
+            # Generate query embedding
+            query_embedding = self._encode([q])[0]
+            
+            with self.engine.connect() as conn:
+                # Use pgvector's cosine similarity operator with proper casting
+                result = conn.execute(
+                    text("""
+                        SELECT content, metadata, 
+                               1 - (embedding <=> CAST(:query_embedding AS vector)) as similarity
+                        FROM documents
+                        ORDER BY embedding <=> CAST(:query_embedding AS vector)
+                        LIMIT :limit
+                    """),
+                    {
+                        "query_embedding": query_embedding.tolist(),
+                        "limit": k
+                    }
+                )
+                
+                results = []
+                for row in result:
+                    content = row[0]
+                    metadata = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+                    similarity = float(row[2])
+                    results.append((content, metadata, similarity))
+                
+                return results
+        except Exception as e:
+            print(f"[VectorStore] Error querying database: {e}")
             return []
-        qv = self._encode([q])[0]
-        sims = self.embeddings @ qv  # cosine (embeddings are normalized)
-        topk = np.argsort(-sims)[:k]
-        return [(self.chunks[i], self.metadatas[i], float(sims[i])) for i in topk]
+
+    def get_chunk_count(self) -> int:
+        """Get the total number of chunks in the database"""
+        try:
+            with self.engine.connect() as conn:
+                result = conn.execute(text("SELECT COUNT(*) FROM documents"))
+                return result.scalar()
+        except Exception as e:
+            print(f"[VectorStore] Error getting chunk count: {e}")
+            return 0
 
 
 store = VectorStore()
@@ -208,7 +302,7 @@ def root():
         "status": "ok",
         "docs": "/docs",
         "data_dir": str(DATA_DIR),
-        "ingested_chunks": len(store.chunks),
+        "ingested_chunks": store.get_chunk_count(),
     }
 
 @app.post("/ingest")
@@ -222,12 +316,64 @@ def ingest(folder: str = Query(default=str(DATA_DIR), description="Folder to ing
 
 @app.post("/ask")
 def ask(body: AskRequest):
+    print(f"[DEBUG] Received question: {body.question}")
     question = (body.question or "").strip()
     if not question:
         raise HTTPException(400, "question is required")
 
+    print(f"[DEBUG] Starting vector query...")
     # retrieve
     results = store.query(question, k=body.top_k or 5)
+    print(f"[DEBUG] Vector query completed, found {len(results)} results")
+    context_text = "No local documents ingested. Use /ingest or add files to data/."
+    if results:
+        context_text = "\n\n".join(
+            f"[source: {m.get('source')}#chunk-{m.get('chunk')}, score: {score:.3f}]\n{text}"
+            for text, m, score in results
+        )
+
+    # For now, return a simple response to test the vector query
+    # TODO: Re-enable CrewAI once Ollama connection is fixed
+    answer = f"Based on the context: {context_text[:200]}..."
+    print(f"[DEBUG] Returning simple answer: {answer[:100]}...")
+
+    return {"answer": answer, "context": context_text}
+
+@app.post("/ask-simple")
+def ask_simple(body: AskRequest):
+    print(f"[DEBUG] Simple ask - Received question: {body.question}")
+    question = (body.question or "").strip()
+    if not question:
+        raise HTTPException(400, "question is required")
+
+    print(f"[DEBUG] Starting vector query...")
+    # retrieve
+    results = store.query(question, k=body.top_k or 5)
+    print(f"[DEBUG] Vector query completed, found {len(results)} results")
+    context_text = "No local documents ingested. Use /ingest or add files to data/."
+    if results:
+        context_text = "\n\n".join(
+            f"[source: {m.get('source')}#chunk-{m.get('chunk')}, score: {score:.3f}]\n{text}"
+            for text, m, score in results
+        )
+
+    # Simple response for testing
+    answer = f"Based on the context: {context_text[:200]}..."
+    print(f"[DEBUG] Returning simple answer: {answer[:100]}...")
+
+    return {"answer": answer, "context": context_text}
+
+@app.post("/ask-old")
+def ask_old(body: AskRequest):
+    print(f"[DEBUG] Received question: {body.question}")
+    question = (body.question or "").strip()
+    if not question:
+        raise HTTPException(400, "question is required")
+
+    print(f"[DEBUG] Starting vector query...")
+    # retrieve
+    results = store.query(question, k=body.top_k or 5)
+    print(f"[DEBUG] Vector query completed, found {len(results)} results")
     context_text = "No local documents ingested. Use /ingest or add files to data/."
     if results:
         context_text = "\n\n".join(
@@ -270,7 +416,7 @@ def list_models():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ingested_chunks": len(store.chunks)}
+    return {"status": "ok", "ingested_chunks": store.get_chunk_count()}
 
 if __name__ == "__main__":
     import uvicorn

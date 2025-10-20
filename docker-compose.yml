@@ -1,4 +1,24 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: postgres-vector
+    environment:
+      POSTGRES_DB: ragdb
+      POSTGRES_USER: raguser
+      POSTGRES_PASSWORD: ragpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [rag-net]
+
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
@@ -31,7 +51,11 @@ services:
       # ✅ point to the ollama SERVICE, not 127.0.0.1
       - OLLAMA_BASE_URL=http://ollama:11434
       - OLLAMA_MODEL=llama3.2
+      # PostgreSQL connection
+      - DATABASE_URL=postgresql://raguser:ragpass@postgres:5432/ragdb
     depends_on:
+      postgres:
+        condition: service_healthy
       ollama:
         condition: service_healthy
     healthcheck:
@@ -69,4 +93,5 @@ networks:
   rag-net:
 
 volumes:
+  postgres_data:
   openwebui-data:

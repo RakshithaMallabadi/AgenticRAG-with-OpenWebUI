@@ -190,3 +190,5 @@ wrapt==1.17.3
 yarl==1.22.0
 youtube-transcript-api==1.2.3
 zipp==3.23.0
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.36
