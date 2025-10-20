@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 from typing import List, Dict
 import json
+import hashlib
 
 from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel
@@ -45,6 +46,11 @@ except ImportError:
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.response_synthesizers import get_response_synthesizer
 from llama_index.core.prompts import PromptTemplate
+
+# Memory and chat
+from llama_index.core.memory import ChatMemoryBuffer
+from llama_index.core.llms import ChatMessage as LLMChatMessage, MessageRole
+import uuid
 
 # CrewAI
 from crewai import Agent, Task, Crew, Process
@@ -86,6 +92,12 @@ llm = Ollama(
     model=OLLAMA_MODEL,
     base_url=OLLAMA_BASE,
     temperature=0.2,
+    context_window=4096,  # Increased for better accuracy
+    request_timeout=120.0,
+    additional_kwargs={
+        "num_ctx": 4096,  # Context window size
+        "num_predict": 512,  # Max tokens to generate
+    },
 )
 
 # Set global LlamaIndex settings
@@ -147,6 +159,30 @@ response_synthesizer = get_response_synthesizer(
     response_mode="compact",
     use_async=False,
 )
+
+# ---------- Conversation Memory ----------
+
+# In-memory session storage (use Redis in production for persistence)
+chat_sessions: Dict[str, ChatMemoryBuffer] = {}
+
+def get_or_create_memory(session_id: str) -> ChatMemoryBuffer:
+    """Get existing chat memory or create a new one for the session."""
+    if session_id not in chat_sessions:
+        chat_sessions[session_id] = ChatMemoryBuffer.from_defaults(
+            token_limit=3000,  # Adjust based on your model's context window
+        )
+        print(f"[Memory] Created new session: {session_id}")
+    else:
+        print(f"[Memory] Using existing session: {session_id}")
+    return chat_sessions[session_id]
+
+def clear_session(session_id: str) -> bool:
+    """Clear conversation history for a session."""
+    if session_id in chat_sessions:
+        del chat_sessions[session_id]
+        print(f"[Memory] Cleared session: {session_id}")
+        return True
+    return False
 
 # ---------- Docling Helper ----------
 _DOC_CONVERTER: DocumentConverter | None = None
@@ -356,6 +392,13 @@ class ChatRequest(BaseModel):
 class AskRequest(BaseModel):
     question: str
     top_k: int | None = 5
+    session_id: str | None = None  # Optional session ID for conversation tracking
+
+class ChatHistoryRequest(BaseModel):
+    session_id: str
+
+class ClearHistoryRequest(BaseModel):
+    session_id: str
 
 # ---- Endpoints ----
 @app.get("/")
@@ -365,6 +408,23 @@ def root():
         "docs": "/docs",
         "data_dir": str(DATA_DIR),
         "vector_store": "LlamaIndex + PGVector",
+        "features": {
+            "conversation_memory": True,
+            "contextual_rag": True,
+            "reranking": True,
+            "citations": True,
+            "document_processing": "Docling",
+        },
+        "endpoints": {
+            "ask": "POST /ask - Stateless RAG queries with re-ranking",
+            "chat": "POST /chat - Conversational RAG with memory",
+            "chat_history": "GET /chat/history/{session_id} - View conversation history",
+            "chat_clear": "POST /chat/clear - Clear specific session history",
+            "chat_sessions": "GET /chat/sessions - List all active sessions",
+            "ingest": "POST /ingest - Ingest documents into vector store",
+            "health": "GET /health - System health check"
+        },
+        "active_sessions": len(chat_sessions)
     }
 
 @app.post("/ingest")
@@ -374,6 +434,163 @@ def ingest(folder: str = Query(default=str(DATA_DIR), description="Folder to ing
         "folder": str(Path(folder).resolve()),
         "files_seen": files,
         "ingested_chunks": n,
+    }
+
+@app.post("/chat")
+def chat_with_memory(body: AskRequest):
+    """
+    Conversational RAG endpoint with memory.
+    
+    Maintains conversation history across multiple messages.
+    Use session_id to track conversations. If not provided, creates a new session.
+    
+    Pipeline:
+    1. Get or create chat memory for the session
+    2. Build context-aware query using conversation history
+    3. Retrieve and re-rank relevant documents
+    4. Format context with citations
+    5. Generate conversational answer
+    6. Update conversation memory
+    """
+    print(f"[Chat] Received question: {body.question}")
+    question = (body.question or "").strip()
+    if not question:
+        raise HTTPException(400, "question is required")
+    
+    # Get or create session
+    session_id = body.session_id or str(uuid.uuid4())
+    memory = get_or_create_memory(session_id)
+    
+    # Step 1: Build context-aware query using chat history
+    chat_history = memory.get_all()
+    context_query = question
+    
+    if chat_history:
+        # Append recent conversation context to improve retrieval
+        recent_msgs = chat_history[-4:] if len(chat_history) > 4 else chat_history
+        recent_context = "\n".join([
+            f"{msg.role}: {msg.content}" 
+            for msg in recent_msgs
+        ])
+        context_query = f"Previous context:\n{recent_context}\n\nCurrent question: {question}"
+        print(f"[Chat] Using conversation context from {len(chat_history)} previous messages")
+    else:
+        print(f"[Chat] Starting new conversation for session {session_id}")
+    
+    # Step 2: Retrieve initial candidates (over-fetch for re-ranking)
+    initial_top_k = (body.top_k or 5) * 2
+    retriever = VectorIndexRetriever(
+        index=index,
+        similarity_top_k=initial_top_k,
+    )
+    
+    nodes = retriever.retrieve(context_query)
+    print(f"[Chat] Retrieved {len(nodes)} initial candidates")
+    
+    # Step 3: Re-rank the nodes
+    try:
+        reranked_nodes = reranker.postprocess_nodes(
+            nodes=nodes,
+            query_str=question,  # Use original question for re-ranking
+        )
+        print(f"[Chat] Re-ranked to {len(reranked_nodes)} nodes")
+    except Exception as e:
+        print(f"[Chat] Re-ranking failed: {e}, using original nodes")
+        reranked_nodes = nodes[:body.top_k or 5]
+    
+    # Step 4: Format context with citations
+    context_parts = []
+    citations = []
+    
+    for i, node in enumerate(reranked_nodes[:body.top_k or 5]):
+        source = node.metadata.get("source", "unknown")
+        file_path = node.metadata.get("file_path", "")
+        score = node.score if hasattr(node, 'score') else 0.0
+        
+        citation = {
+            "index": i + 1,
+            "source": source,
+            "file_path": file_path,
+            "score": float(score),
+            "text_preview": node.text[:200] + "..." if len(node.text) > 200 else node.text
+        }
+        citations.append(citation)
+        
+        context_parts.append(
+            f"[{i+1}] Source: {source} (Score: {score:.3f})\n{node.text}\n"
+        )
+    
+    context_text = "\n\n".join(context_parts) if context_parts else "No documents found."
+    
+    # Step 5: Generate conversational answer using LLM
+    if context_parts:
+        # Build a concise context for LLM (show more text for better accuracy)
+        simple_context = "\n\n".join([
+            f"Source {i+1}: {node.text[:1000]}" 
+            for i, node in enumerate(reranked_nodes[:body.top_k or 5])
+        ])
+        
+        # Add conversation context if exists
+        conversation_context = ""
+        if chat_history and len(chat_history) > 0:
+            recent_history = chat_history[-6:] if len(chat_history) > 6 else chat_history
+            conversation_context = "Previous conversation:\n" + "\n".join([
+                f"{msg.role}: {msg.content[:150]}" 
+                for msg in recent_history
+            ]) + "\n\n"
+        
+        prompt = f"""{conversation_context}Context from documents:
+{simple_context}
+
+Question: {question}
+
+Please provide a clear, accurate answer based ONLY on the information in the context above. Extract specific details like names, organizations, dates, and titles exactly as they appear in the documents. Reference source numbers when appropriate."""
+        
+        # Generate answer using LLM
+        try:
+            from llama_index.core.llms import ChatMessage as LLMChatMsg
+            
+            response = llm.chat([
+                LLMChatMsg(role="system", content="You are a precise document analyst. Extract EXACT information from documents:\n• Include full names with titles (H.E., Dr., etc.)\n• Include complete organization names\n• Include specific dates, numbers, and roles\n• Quote directly from source when possible\n• Never generalize if specific details exist in the context"),
+                LLMChatMsg(role="user", content=prompt)
+            ])
+            
+            llm_answer = str(response.message.content)
+            
+            # Add source citations
+            citations_text = "\n\n**Sources:**\n" + "\n".join([
+                f"[{i+1}] {node.metadata.get('source', 'unknown')} (relevance: {node.score if hasattr(node, 'score') else 0.0:.2f})"
+                for i, node in enumerate(reranked_nodes[:body.top_k or 5])
+            ])
+            
+            answer = llm_answer + citations_text
+            
+        except Exception as e:
+            print(f"[Chat] LLM generation failed: {e}, returning context-based answer")
+            # Fallback to context-based answer
+            answer = f"""Based on the retrieved documents:
+
+{context_text}
+---
+Retrieved {len(reranked_nodes)} contextually-enhanced chunks."""
+    else:
+        answer = "No relevant information found in the knowledge base for your question."
+    
+    # Step 6: Update conversation memory
+    memory.put(LLMChatMessage(role=MessageRole.USER, content=question))
+    memory.put(LLMChatMessage(role=MessageRole.ASSISTANT, content=answer))
+    print(f"[Chat] Updated memory. Total messages: {len(memory.get_all())}")
+    
+    return {
+        "answer": answer,
+        "context": context_text,
+        "retrieved_nodes": len(reranked_nodes),
+        "citations": citations,
+        "reranked": True,
+        "reranker_type": "cohere" if _HAS_COHERE and os.getenv("COHERE_API_KEY") else "similarity",
+        "session_id": session_id,
+        "conversation_length": len(memory.get_all()),
+        "is_new_session": len(chat_history) == 0
     }
 
 @app.post("/ask")
@@ -463,34 +680,173 @@ Use the [number] references to cite specific sources."""
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
+    """
+    OpenAI-compatible chat completions endpoint with conversation memory.
+    
+    This endpoint wraps the /chat logic to provide:
+    - Conversation memory
+    - Contextual RAG with re-ranking
+    - Citation handling
+    
+    OpenWebUI calls this endpoint and gets full RAG capabilities.
+    """
     user_msgs = [m.content for m in req.messages if m.role == "user"]
     if not user_msgs:
         raise HTTPException(400, "No user message provided")
     question = user_msgs[-1]
-
-    # Use LlamaIndex query engine
-    query_engine = index.as_query_engine(
-        similarity_top_k=5,
-        response_mode="compact",
+    
+    # Generate deterministic session_id based on conversation start
+    # This ensures the same conversation in OpenWebUI maintains memory
+    conversation_start = json.dumps([
+        {"role": m.role, "content": m.content[:100]} 
+        for m in req.messages[:2]  # First 2 messages define the conversation
+    ], sort_keys=True)
+    
+    session_id = f"webui-{hashlib.md5(conversation_start.encode()).hexdigest()}"
+    
+    print(f"[OpenWebUI] Question: {question}")
+    print(f"[OpenWebUI] Session: {session_id}, Messages in request: {len(req.messages)}")
+    
+    # Get or create memory for this session
+    memory = get_or_create_memory(session_id)
+    existing_messages = memory.get_all()
+    
+    # Sync OpenWebUI conversation with our memory
+    # Only add new messages that aren't already in memory
+    if len(existing_messages) < len(req.messages):
+        # Add missing messages from OpenWebUI to our memory
+        for msg in req.messages[len(existing_messages):]:
+            role = MessageRole.USER if msg.role == "user" else MessageRole.ASSISTANT
+            memory.put(LLMChatMessage(role=role, content=msg.content))
+    
+    # Build context-aware query using conversation history
+    chat_history = memory.get_all()
+    context_query = question
+    
+    if len(chat_history) > 2:  # Has previous conversation context
+        # Use last 4 messages (excluding current) for context
+        recent_msgs = [msg for msg in chat_history[:-1]][-4:]
+        recent_context = "\n".join([
+            f"{msg.role}: {msg.content[:200]}" 
+            for msg in recent_msgs
+        ])
+        context_query = f"Previous conversation:\n{recent_context}\n\nCurrent question: {question}"
+        print(f"[OpenWebUI] Using {len(recent_msgs)} previous messages for context")
+    
+    # Retrieve initial candidates (over-fetch for re-ranking)
+    initial_top_k = 10
+    retriever = VectorIndexRetriever(
+        index=index,
+        similarity_top_k=initial_top_k,
     )
     
-    # Query
-    response = query_engine.query(question)
-    text = str(response)
+    nodes = retriever.retrieve(context_query)
+    print(f"[OpenWebUI] Retrieved {len(nodes)} initial candidates")
+    
+    # Re-rank the nodes
+    try:
+        reranked_nodes = reranker.postprocess_nodes(
+            nodes=nodes,
+            query_str=question,  # Use original question for re-ranking
+        )
+        print(f"[OpenWebUI] Re-ranked to {len(reranked_nodes)} nodes")
+    except Exception as e:
+        print(f"[OpenWebUI] Re-ranking failed: {e}, using original nodes")
+        reranked_nodes = nodes[:5]
+    
+    # Format context with citations
+    context_parts = []
+    for i, node in enumerate(reranked_nodes[:5]):
+        source = node.metadata.get("source", "unknown")
+        score = node.score if hasattr(node, 'score') else 0.0
+        context_parts.append(
+            f"**[{i+1}]** {source} (relevance: {score:.2f})\n{node.text}\n"
+        )
+    
+    # Generate conversational answer with citations
+    if context_parts:
+        context_text = "\n\n".join(context_parts)
+        
+        # Build a concise context for LLM (show more text for better accuracy)
+        simple_context = "\n\n".join([
+            f"Source {i+1}: {node.text[:1000]}" 
+            for i, node in enumerate(reranked_nodes[:5])
+        ])
+        
+        # Create prompt for LLM to generate answer
+        conversation_context = ""
+        if len(chat_history) > 2:
+            recent_msgs = [msg for msg in chat_history[:-1]][-4:]
+            conversation_context = "Previous conversation:\n" + "\n".join([
+                f"{msg.role}: {msg.content[:150]}" 
+                for msg in recent_msgs
+            ]) + "\n\n"
+        
+        prompt = f"""{conversation_context}Context from documents:
+{simple_context}
 
+Question: {question}
+
+Please provide a clear, accurate answer based ONLY on the information in the context above. Extract specific details like names, organizations, dates, and titles exactly as they appear in the documents. Reference source numbers when appropriate."""
+        
+        # Generate answer using LLM
+        try:
+            from llama_index.core import PromptTemplate
+            from llama_index.core.llms import ChatMessage as LLMChatMsg
+            
+            # Use the LLM to generate a response
+            response = llm.chat([
+                LLMChatMsg(role="system", content="You are a precise document analyst. Extract EXACT information from documents:\n• Include full names with titles (H.E., Dr., etc.)\n• Include complete organization names\n• Include specific dates, numbers, and roles\n• Quote directly from source when possible\n• Never generalize if specific details exist in the context"),
+                LLMChatMsg(role="user", content=prompt)
+            ])
+            
+            llm_answer = str(response.message.content)
+            
+            # Add source citations at the end
+            citations_text = "\n\n**Sources:**\n" + "\n".join([
+                f"[{i+1}] {node.metadata.get('source', 'unknown')} (relevance: {node.score if hasattr(node, 'score') else 0.0:.2f})"
+                for i, node in enumerate(reranked_nodes[:5])
+            ])
+            
+            answer = llm_answer + citations_text
+            
+        except Exception as e:
+            print(f"[OpenWebUI] LLM generation failed: {e}, returning context")
+            # Fallback to context-based answer
+            answer = f"""Based on the retrieved documents:
+
+{context_text}
+
+---
+📚 Retrieved {len(reranked_nodes)} contextually-enhanced sources."""
+    else:
+        answer = "I don't have relevant information in my knowledge base to answer that question."
+    
+    # Update memory with assistant's response
+    memory.put(LLMChatMessage(role=MessageRole.ASSISTANT, content=answer))
+    print(f"[OpenWebUI] Memory updated. Total messages: {len(memory.get_all())}")
+    
+    # Return in OpenAI format for OpenWebUI compatibility
     return {
-        "id": "chatcmpl-llamaindex-rag",
+        "id": f"chatcmpl-{session_id}",
         "object": "chat.completion",
         "created": int(datetime.utcnow().timestamp()),
         "model": req.model or OLLAMA_MODEL,
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
+                "message": {
+                    "role": "assistant", 
+                    "content": answer
+                },
                 "finish_reason": "stop"
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": {
+            "prompt_tokens": len(question.split()),
+            "completion_tokens": len(answer.split()),
+            "total_tokens": len(question.split()) + len(answer.split())
+        },
     }
 
 @app.get("/v1/models")
@@ -500,6 +856,87 @@ def list_models():
         "data": [
             {"id": "llamaindex-rag", "object": "model", "owned_by": "local"},
         ]
+    }
+
+# ---- Chat History Management Endpoints ----
+
+@app.get("/chat/history/{session_id}")
+def get_chat_history(session_id: str):
+    """
+    Get conversation history for a specific session.
+    
+    Returns all messages in the conversation with their roles and content.
+    """
+    if session_id not in chat_sessions:
+        raise HTTPException(404, f"Session '{session_id}' not found")
+    
+    memory = chat_sessions[session_id]
+    messages = memory.get_all()
+    
+    return {
+        "session_id": session_id,
+        "message_count": len(messages),
+        "messages": [
+            {
+                "role": str(msg.role),
+                "content": msg.content,
+            }
+            for msg in messages
+        ]
+    }
+
+@app.post("/chat/clear")
+def clear_chat_history(body: ClearHistoryRequest):
+    """
+    Clear conversation history for a specific session.
+    
+    This removes all messages from the session's memory.
+    """
+    success = clear_session(body.session_id)
+    
+    if success:
+        return {
+            "status": "success",
+            "message": f"Cleared history for session '{body.session_id}'",
+            "session_id": body.session_id
+        }
+    else:
+        raise HTTPException(404, f"Session '{body.session_id}' not found")
+
+@app.get("/chat/sessions")
+def list_sessions():
+    """
+    List all active chat sessions.
+    
+    Returns session IDs and message counts for all active conversations.
+    """
+    return {
+        "active_sessions": len(chat_sessions),
+        "sessions": [
+            {
+                "session_id": sid,
+                "message_count": len(memory.get_all()),
+                "last_message": memory.get_all()[-1].content[:100] + "..." if memory.get_all() else None
+            }
+            for sid, memory in chat_sessions.items()
+        ]
+    }
+
+@app.delete("/chat/sessions")
+def clear_all_sessions():
+    """
+    Clear all chat sessions.
+    
+    WARNING: This removes all conversation history from all sessions.
+    """
+    session_count = len(chat_sessions)
+    chat_sessions.clear()
+    print(f"[Memory] Cleared all {session_count} sessions")
+    
+    return {
+        "status": "success",
+        "message": f"Cleared all {session_count} sessions",
+        "sessions_cleared": session_count
     }
 
 @app.get("/health")
