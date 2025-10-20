@@ -8,31 +8,41 @@ _os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 _os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
 # ----------------------------------------------------------------------
 
-import os, glob
+import os
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Dict
 import json
 
-import numpy as np
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
-from fastapi import HTTPException
-import asyncio
-from crewai import Agent, Task, Crew, Process  # CrewAI (no crewai_tools)
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from sqlalchemy import create_engine
-from sqlalchemy.sql import text
+from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
+import httpx
 
-# Optional Docling support (PDF parsing). If unavailable, we skip PDFs gracefully.
+# LlamaIndex imports
+from llama_index.core import (
+    VectorStoreIndex,
+    Document,
+    StorageContext,
+    Settings,
+)
+from llama_index.vector_stores.postgres import PGVectorStore
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.llms.ollama import Ollama
+from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core.node_parser import SentenceSplitter
+
+# CrewAI
+from crewai import Agent, Task, Crew, Process
+
+# Optional Docling support (PDF parsing)
 try:
-    from docling.document_converter import DocumentConverter  # type: ignore
+    from docling.document_converter import DocumentConverter
     _HAS_DOCLING = True
 except Exception as e:
     print(f"[Docling] Failed to import: {e}")
-    DocumentConverter = None  # type: ignore
+    DocumentConverter = None
     _HAS_DOCLING = False
 
 load_dotenv()
@@ -41,14 +51,58 @@ load_dotenv()
 ROOT_DIR = Path(__file__).parent.resolve()
 DATA_DIR = ROOT_DIR / "data"
 
-# ---------- PostgreSQL Vector Store ----------
+# ---------- LlamaIndex Configuration ----------
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import ProgrammingError
+# Database connection
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", 
+    "postgresql://raguser:ragpass@postgres:5432/ragdb"
+)
 
-# NEW: single global Docling converter (lazy init)
+# Configure embedding model
+embed_model = HuggingFaceEmbedding(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    device="cpu"
+)
+
+# Configure LLM
+OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+
+llm = Ollama(
+    model=OLLAMA_MODEL,
+    base_url=OLLAMA_BASE,
+    temperature=0.2,
+)
+
+# Set global LlamaIndex settings
+Settings.embed_model = embed_model
+Settings.llm = llm
+Settings.chunk_size = 512
+Settings.chunk_overlap = 50
+
+# Initialize PGVector store
+print("[LlamaIndex] Initializing PGVectorStore...")
+vector_store = PGVectorStore.from_params(
+    database=DATABASE_URL.split("/")[-1],
+    host=DATABASE_URL.split("@")[1].split(":")[0],
+    password=DATABASE_URL.split(":")[2].split("@")[0],
+    port=int(DATABASE_URL.split(":")[-1].split("/")[0]),
+    user=DATABASE_URL.split("://")[1].split(":")[0],
+    table_name="llamaindex_documents",
+    embed_dim=384,  # dimension for all-MiniLM-L6-v2
+)
+
+# Create storage context and index
+storage_context = StorageContext.from_defaults(vector_store=vector_store)
+index = VectorStoreIndex.from_vector_store(
+    vector_store=vector_store,
+    storage_context=storage_context,
+)
+print("[LlamaIndex] Vector store initialized successfully")
+
+# ---------- Docling Helper ----------
 _DOC_CONVERTER: DocumentConverter | None = None
-
 
 def _get_docling() -> DocumentConverter | None:
     if not _HAS_DOCLING:
@@ -57,7 +111,7 @@ def _get_docling() -> DocumentConverter | None:
     global _DOC_CONVERTER
     if _DOC_CONVERTER is None:
         try:
-            _DOC_CONVERTER = DocumentConverter()  # type: ignore[call-arg]
+            _DOC_CONVERTER = DocumentConverter()
             print("[Docling] DocumentConverter initialized successfully")
         except Exception as e:
             print(f"[Docling] Failed to initialize DocumentConverter: {e}")
@@ -66,12 +120,9 @@ def _get_docling() -> DocumentConverter | None:
             return None
     return _DOC_CONVERTER
 
-
-# --- replace _read_text_from_path with this ---
 def _read_text_from_path(p: Path) -> str:
     """
     Returns text for .txt/.md; uses Docling for .pdf.
-    Logs parse stats so you can see why a file yields 0 chunks.
     """
     suf = p.suffix.lower()
     if suf in {".txt", ".md"}:
@@ -88,22 +139,19 @@ def _read_text_from_path(p: Path) -> str:
             return ""
             
         try:
-            # Try to convert the PDF
             result = None
             try:
-                # Try the simplest API first (path as string)
                 result = converter.convert(str(p))
             except Exception as e1:
                 print(f"[Docling] Direct convert failed for {p}: {e1}")
                 return ""
 
-            # Extract document from result
             doc = getattr(result, "document", None) if result else None
             if doc is None:
                 print(f"[Docling] No document in result for {p}")
                 return ""
 
-            # Try to export as markdown first (preferred)
+            # Try markdown export
             try:
                 if hasattr(doc, "export_to_markdown"):
                     md = doc.export_to_markdown()
@@ -113,7 +161,7 @@ def _read_text_from_path(p: Path) -> str:
             except Exception as e:
                 print(f"[Docling] export_to_markdown failed: {e}")
 
-            # Fallback to text export
+            # Fallback to text
             try:
                 if hasattr(doc, "export_to_text"):
                     txt = doc.export_to_text()
@@ -131,146 +179,60 @@ def _read_text_from_path(p: Path) -> str:
             traceback.print_exc()
             return ""
 
-    # other extensions -> ignored
     return ""
 
+# ---------- Ingestion Function ----------
+def ingest_documents(folder: Path = DATA_DIR, patterns: tuple = ("*.txt", "*.md", "*.pdf")):
+    """Ingest documents using LlamaIndex"""
+    folder = Path(folder).resolve()
+    files = []
+    for pat in patterns:
+        files.extend(sorted(folder.rglob(pat)))
 
-class VectorStore:
-    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", database_url: str = None):
-        self.embedder = SentenceTransformer(model_name, device="cpu")
-        # IMPORTANT: default to the Docker service, not localhost
-        self.database_url = database_url or os.getenv(
-            "DATABASE_URL"
-        )
-        self.engine = create_engine(self.database_url, future=True)
-        self._init_database()
-
-    def _init_database(self):
-        with self.engine.begin() as conn:
-            # enable extension
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            # create table (embedding dimension = 384 for MiniLM-L6-v2; set 768 if you change models)
-            conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS documents (
-              id SERIAL PRIMARY KEY,
-              content TEXT NOT NULL,
-              embedding VECTOR(384) NOT NULL,
-              metadata JSONB,
-              source TEXT,
-              chunk_index INT
-            )
-            """))
-
-    @staticmethod
-    def _chunk(text: str, size: int = 500, overlap: int = 80):
-        tokens = text.split()
-        out, step, i = [], max(1, size - overlap), 0
-        while i < len(tokens):
-            out.append(" ".join(tokens[i:i + size]))
-            i += step
-        return out
-
-    def _encode(self, texts: List[str]) -> np.ndarray:
-        vecs = self.embedder.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
-        return vecs.astype(np.float32)
-
-    def ingest_folder(
-            self,
-            folder: str | Path = DATA_DIR,
-            patterns: tuple[str, ...] = ("*.txt", "*.md", "*.pdf")  # NEW: include PDFs
-    ) -> tuple[int, list[str]]:
-        folder = Path(folder).resolve()
-        files: list[Path] = []
-        for pat in patterns:
-            files.extend(sorted(folder.rglob(pat)))
-
-        texts, metas = [], []
-        for p in files:
-            try:
-                raw = _read_text_from_path(p)
-                raw = (raw or "").strip()
-            except Exception as e:
-                print(f"[ingest] skip {p}: {e}")
+    documents = []
+    for p in files:
+        try:
+            text = _read_text_from_path(p)
+            if not text or not text.strip():
                 continue
-            if not raw:
-                continue
-            for idx, chunk in enumerate(self._chunk(raw)):
-                texts.append(chunk)
-                metas.append({"source": p.name, "chunk": idx, "path": str(p)})
-
-        if not texts:
-            return 0, [str(p) for p in files]
-
-        embeddings = self._encode(texts)
-
-        with self.engine.begin() as conn:
-            # clear any old rows from this path
-            conn.execute(
-                text("DELETE FROM documents WHERE metadata->>'path' LIKE :pattern"),
-                {"pattern": f"{folder}%"}
+            
+            # Create LlamaIndex Document with metadata
+            doc = Document(
+                text=text,
+                metadata={
+                    "source": p.name,
+                    "file_path": str(p),
+                    "file_type": p.suffix,
+                }
             )
-            # bulk insert; embed and metadata literals are inlined to avoid parameter cast issues
-            for text_content, meta, emb in zip(texts, metas, embeddings):
-                emb_lit = "[" + ",".join(str(float(x)) for x in emb.tolist()) + "]"
-                meta_json = json.dumps(meta).replace("'", "''")
-                sql = f"""
-                      INSERT INTO documents (content, embedding, metadata, source, chunk_index)
-                      VALUES (:content, '{emb_lit}'::vector, '{meta_json}'::jsonb, :source, :chunk_index)
-                    """
-                conn.execute(
-                    text(sql),
-                    {
-                        "content": text_content,
-                        "source": meta.get("source", ""),
-                        "chunk_index": int(meta.get("chunk", 0)),
-                    }
-                )
-        print(f"[VectorStore] Stored {len(texts)} documents")
-        return len(texts), [str(p) for p in files]
+            documents.append(doc)
+            print(f"[Ingest] Added document: {p.name}")
+        except Exception as e:
+            print(f"[ingest] skip {p}: {e}")
+            continue
 
-    def query(self, q: str, k: int = 5) -> List[Tuple[str, Dict, float]]:
-        q_emb = self._encode([q])[0]
-        q_lit = "[" + ",".join(str(float(x)) for x in q_emb.tolist()) + "]"
-        with self.engine.begin() as conn:
-            sql = f"""
-                  SELECT content, metadata, 1 - (embedding <=> '{q_lit}'::vector) AS similarity
-                  FROM documents
-                  ORDER BY embedding <=> '{q_lit}'::vector
-                  LIMIT :k
-                """
-            rows = conn.execute(text(sql), {"k": k}).fetchall()
-        out = []
-        for content, metadata, sim in rows:
-            meta = metadata if isinstance(metadata, dict) else json.loads(metadata)
-            out.append((content, meta, float(sim)))
-        return out
+    if not documents:
+        return 0, [str(p) for p in files]
 
-    def get_chunk_count(self) -> int:
-        with self.engine.begin() as conn:
-            return int(conn.execute(text("SELECT COUNT(*) FROM documents")).scalar() or 0)
-
-
-store = VectorStore()
-# Do not auto-ingest at startup; call /ingest explicitly after DB is ready
-
-# ---------- LiteLLM-style LLM selection for CrewAI ----------
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
-OLLAMA_BASE = os.getenv("OLLAMA_BASE_URL", "")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
-
-if OPENAI_KEY:
-    os.environ.setdefault("OPENAI_API_KEY", OPENAI_KEY)
-    llm_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # e.g., gpt-4o-mini
-elif OLLAMA_BASE:
-    llm_model = f"ollama/{OLLAMA_MODEL}"  # e.g., ollama/llama3.2:3b
-    os.environ.setdefault("OLLAMA_API_BASE", OLLAMA_BASE)  # e.g., http://localhost:11434
-else:
-    raise RuntimeError(
-        "No LLM configured. Set OPENAI_API_KEY (and optional OPENAI_MODEL) "
-        "or OLLAMA_BASE_URL and OLLAMA_MODEL."
+    # Parse documents into nodes with chunking
+    text_splitter = SentenceSplitter(
+        chunk_size=512,
+        chunk_overlap=50,
     )
+    nodes = text_splitter.get_nodes_from_documents(documents)
+    
+    print(f"[LlamaIndex] Created {len(nodes)} nodes from {len(documents)} documents")
+    
+    # Insert nodes into vector store
+    index.insert_nodes(nodes)
+    
+    print(f"[LlamaIndex] Ingested {len(nodes)} chunks")
+    return len(nodes), [str(p) for p in files]
 
-# ---------- CrewAI Agent (no external tools) ----------
+# ---------- CrewAI Agent ----------
+llm_model = f"ollama/{OLLAMA_MODEL}"
+os.environ.setdefault("OLLAMA_API_BASE", OLLAMA_BASE)
+
 rag_agent = Agent(
     role="RAG Answerer",
     goal=(
@@ -281,19 +243,13 @@ rag_agent = Agent(
         "You are a careful analyst. You never invent facts. You keep answers concise "
         "and always include exact sources from the provided context."
     ),
-    llm=llm_model,  # <- pass model string (LiteLLM style)
+    llm=llm_model,
     verbose=False,
 )
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Simple RAG (FastAPI + CrewAI)")
+app = FastAPI(title="LlamaIndex RAG (FastAPI + CrewAI)")
 
-# add near the top with other imports
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import HTTPException
-from datetime import datetime
-
-# after `app = FastAPI(...)` add CORS (OpenWebUI runs on :3000 by default)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -301,12 +257,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ---- Minimal OpenAI-compatible /v1/chat/completions ----
+# ---- Models ----
 class ChatMessage(BaseModel):
     role: str
     content: str
-
 
 class ChatRequest(BaseModel):
     model: str | None = None
@@ -314,75 +268,28 @@ class ChatRequest(BaseModel):
     stream: bool | None = False
     temperature: float | None = 0.2
 
-
-import httpx
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest):
-    user_msgs = [m.content for m in req.messages if m.role == "user"]
-    if not user_msgs:
-        raise HTTPException(400, "No user message provided")
-    question = user_msgs[-1]
-
-    # retrieve top-k
-    results = store.query(question, k=5)
-    context = "No local documents ingested." if not results else "\n\n".join(
-        f"[source: {m.get('source')}#chunk-{m.get('chunk')}, score: {s:.3f}]\n{t}"
-        for t, m, s in results
-    )
-    prompt = (
-        "Answer ONLY from the context, cite like [file#chunk-N]. If insufficient, say so.\n\n"
-        f"Question:\n{question}\n\nContext:\n{context}\n"
-    )
-
-    payload = {
-        "model": os.getenv("OLLAMA_MODEL", "llama3.2"),
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "options": {"temperature": req.temperature or 0.2}
-    }
-    async with httpx.AsyncClient(timeout=None) as client:
-        r = await client.post(f"{os.getenv('OLLAMA_BASE_URL', 'http://ollama:11434')}/api/chat", json=payload)
-        r.raise_for_status()
-        data = r.json()
-        text = (data.get("message") or {}).get("content", "")
-
-    from datetime import datetime
-    return {
-        "id": "chatcmpl-ollama-rag",
-        "object": "chat.completion",
-        "created": int(datetime.utcnow().timestamp()),
-        "model": payload["model"],
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
-
-
 class AskRequest(BaseModel):
     question: str
     top_k: int | None = 5
 
-
+# ---- Endpoints ----
 @app.get("/")
 def root():
     return {
         "status": "ok",
         "docs": "/docs",
         "data_dir": str(DATA_DIR),
-        "ingested_chunks": store.get_chunk_count(),
+        "vector_store": "LlamaIndex + PGVector",
     }
-
 
 @app.post("/ingest")
 def ingest(folder: str = Query(default=str(DATA_DIR), description="Folder to ingest")):
-    n, files = store.ingest_folder(folder)
+    n, files = ingest_documents(folder)
     return {
         "folder": str(Path(folder).resolve()),
         "files_seen": files,
         "ingested_chunks": n,
     }
-
 
 @app.post("/ask")
 def ask(body: AskRequest):
@@ -391,41 +298,90 @@ def ask(body: AskRequest):
     if not question:
         raise HTTPException(400, "question is required")
 
-    print(f"[DEBUG] Starting vector query...")
-    # retrieve
-    results = store.query(question, k=body.top_k or 5)
-    print(f"[DEBUG] Vector query completed, found {len(results)} results")
-    context_text = "No local documents ingested. Use /ingest or add files to data/."
-    if results:
-        context_text = "\n\n".join(
-            f"[source: {m.get('source')}#chunk-{m.get('chunk')}, score: {score:.3f}]\n{text}"
-            for text, m, score in results
+    # Use LlamaIndex retriever
+    retriever = VectorIndexRetriever(
+        index=index,
+        similarity_top_k=body.top_k or 5,
+    )
+    
+    # Retrieve nodes
+    nodes = retriever.retrieve(question)
+    print(f"[DEBUG] Retrieved {len(nodes)} nodes")
+    
+    # Format context with citations
+    context_parts = []
+    for i, node in enumerate(nodes):
+        source = node.metadata.get("source", "unknown")
+        score = node.score if hasattr(node, 'score') else 0.0
+        context_parts.append(
+            f"[source: {source}, score: {score:.3f}]\n{node.text}"
         )
+    
+    context_text = "\n\n".join(context_parts) if context_parts else "No documents found."
+    
+    # Generate simple answer from retrieved context (without LLM)
+    if context_parts:
+        answer = f"Based on the retrieved documents:\n\n{context_text}"
+    else:
+        answer = "No relevant information found in the knowledge base."
+    
+    return {"answer": answer, "context": context_text, "retrieved_nodes": len(nodes)}
 
-    # For now, return a simple response to test the vector query
-    # TODO: Re-enable CrewAI once Ollama connection is fixed
-    answer = f"Based on the context: {context_text[:200]}..."
-    print(f"[DEBUG] Returning simple answer: {answer[:100]}...")
+@app.post("/v1/chat/completions")
+async def chat_completions(req: ChatRequest):
+    user_msgs = [m.content for m in req.messages if m.role == "user"]
+    if not user_msgs:
+        raise HTTPException(400, "No user message provided")
+    question = user_msgs[-1]
 
-    return {"answer": answer, "context": context_text}
+    # Use LlamaIndex query engine
+    query_engine = index.as_query_engine(
+        similarity_top_k=5,
+        response_mode="compact",
+    )
+    
+    # Query
+    response = query_engine.query(question)
+    text = str(response)
 
+    return {
+        "id": "chatcmpl-llamaindex-rag",
+        "object": "chat.completion",
+        "created": int(datetime.utcnow().timestamp()),
+        "model": req.model or OLLAMA_MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
 
 @app.get("/v1/models")
 def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": "crew-rag222", "object": "model", "owned_by": "local"},
+            {"id": "llamaindex-rag", "object": "model", "owned_by": "local"},
         ]
     }
 
-
 @app.get("/health")
 def health():
-    return {"status": "ok", "ingested_chunks": store.get_chunk_count()}
-
+    try:
+        # Check vector store
+        retriever = VectorIndexRetriever(index=index, similarity_top_k=1)
+        nodes = retriever.retrieve("test")
+        return {
+            "status": "ok",
+            "vector_store": "LlamaIndex + PGVector",
+            "nodes_available": len(nodes) > 0
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="127.0.0.1", port=8000, workers=1)

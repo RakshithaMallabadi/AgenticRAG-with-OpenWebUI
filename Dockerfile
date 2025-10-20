@@ -12,9 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # deps
-COPY requirements.txt /app/requirements.txt
+COPY requirements_llamaindex.txt /app/requirements_llamaindex.txt
 RUN python -m pip install --upgrade pip setuptools wheel && \
-    pip install --prefer-binary -r requirements.txt
+    pip install --prefer-binary -r requirements_llamaindex.txt
 
 # app
 COPY . /app
