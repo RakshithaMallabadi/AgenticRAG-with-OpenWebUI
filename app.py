@@ -32,27 +32,38 @@ ROOT_DIR = Path(__file__).parent.resolve()
 DATA_DIR = ROOT_DIR / "data"
 
 # ---------- PostgreSQL Vector Store ----------
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import ProgrammingError
+
 class VectorStore:
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2", database_url: str = None):
-        # CPU for stability on macOS; change to device="cuda" if you have GPU
         self.embedder = SentenceTransformer(model_name, device="cpu")
-        self.database_url = database_url or os.getenv("DATABASE_URL", "postgresql://raguser:ragpass@localhost:5432/ragdb")
-        self.engine = create_engine(self.database_url)
+        # IMPORTANT: default to the Docker service, not localhost
+        self.database_url = database_url or os.getenv(
+            "DATABASE_URL"
+        )
+        self.engine = create_engine(self.database_url, future=True)
         self._init_database()
 
     def _init_database(self):
-        """Initialize database connection and ensure tables exist"""
-        try:
-            with self.engine.connect() as conn:
-                # Test connection
-                conn.execute(text("SELECT 1"))
-                print("[VectorStore] Connected to PostgreSQL database")
-        except Exception as e:
-            print(f"[VectorStore] Database connection failed: {e}")
-            raise
+        with self.engine.begin() as conn:
+            # enable extension
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            # create table (embedding dimension = 384 for MiniLM-L6-v2; set 768 if you change models)
+            conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS documents (
+              id SERIAL PRIMARY KEY,
+              content TEXT NOT NULL,
+              embedding VECTOR(384) NOT NULL,
+              metadata JSONB,
+              source TEXT,
+              chunk_index INT
+            )
+            """))
 
     @staticmethod
-    def _chunk(text: str, size: int = 500, overlap: int = 80) -> List[str]:
+    def _chunk(text: str, size: int = 500, overlap: int = 80):
         tokens = text.split()
         out, step, i = [], max(1, size - overlap), 0
         while i < len(tokens):
@@ -61,16 +72,10 @@ class VectorStore:
         return out
 
     def _encode(self, texts: List[str]) -> np.ndarray:
-        vecs = self.embedder.encode(
-            texts, normalize_embeddings=True, convert_to_numpy=True
-        )
+        vecs = self.embedder.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
         return vecs.astype(np.float32)
 
-    def ingest_folder(
-        self,
-        folder: str | Path = DATA_DIR,
-        patterns: tuple[str, ...] = ("*.txt", "*.md"),
-    ) -> tuple[int, list[str]]:
+    def ingest_folder(self, folder: str | Path = DATA_DIR, patterns: tuple[str, ...] = ("*.txt", "*.md")) -> tuple[int, list[str]]:
         folder = Path(folder).resolve()
         files: list[Path] = []
         for pat in patterns:
@@ -84,7 +89,6 @@ class VectorStore:
                 print(f"[ingest] skip {p}: {e}")
                 continue
             if not raw:
-                print(f"[ingest] skip empty {p}")
                 continue
             for idx, chunk in enumerate(self._chunk(raw)):
                 texts.append(chunk)
@@ -93,100 +97,57 @@ class VectorStore:
         if not texts:
             return 0, [str(p) for p in files]
 
-        # Clear existing data for this folder
-        self._clear_existing_data(folder)
-
-        # Generate embeddings
         embeddings = self._encode(texts)
-        
-        # Store in PostgreSQL
-        self._store_embeddings(texts, metas, embeddings)
-        
-        return len(texts), [str(p) for p in files]
 
-    def _clear_existing_data(self, folder: Path):
-        """Clear existing data for the given folder"""
-        try:
-            with self.engine.connect() as conn:
+        with self.engine.begin() as conn:
+            # clear any old rows from this path
+            conn.execute(
+                text("DELETE FROM documents WHERE metadata->>'path' LIKE :pattern"),
+                {"pattern": f"{folder}%"}
+            )
+            # bulk insert; embed and metadata literals are inlined to avoid parameter cast issues
+            for text_content, meta, emb in zip(texts, metas, embeddings):
+                emb_lit = "[" + ",".join(str(float(x)) for x in emb.tolist()) + "]"
+                meta_json = json.dumps(meta).replace("'", "''")
+                sql = f"""
+                      INSERT INTO documents (content, embedding, metadata, source, chunk_index)
+                      VALUES (:content, '{emb_lit}'::vector, '{meta_json}'::jsonb, :source, :chunk_index)
+                    """
                 conn.execute(
-                    text("DELETE FROM documents WHERE metadata->>'path' LIKE :pattern"),
-                    {"pattern": f"{folder}%"}
-                )
-                conn.commit()
-        except Exception as e:
-            print(f"[VectorStore] Error clearing existing data: {e}")
-
-    def _store_embeddings(self, texts: List[str], metas: List[Dict], embeddings: np.ndarray):
-        """Store texts, metadata, and embeddings in PostgreSQL"""
-        try:
-            with self.engine.connect() as conn:
-                for i, (text_content, meta, embedding) in enumerate(zip(texts, metas, embeddings)):
-                    conn.execute(
-                        text("""
-                            INSERT INTO documents (content, embedding, metadata, source, chunk_index)
-                            VALUES (:content, :embedding, :metadata, :source, :chunk_index)
-                        """),
-                        {
-                            "content": text_content,
-                            "embedding": embedding.tolist(),  # Convert numpy array to list
-                            "metadata": json.dumps(meta),
-                            "source": meta.get("source", ""),
-                            "chunk_index": meta.get("chunk", 0)
-                        }
-                    )
-                conn.commit()
-                print(f"[VectorStore] Stored {len(texts)} documents in PostgreSQL")
-        except Exception as e:
-            print(f"[VectorStore] Error storing embeddings: {e}")
-            raise
-
-    def query(self, q: str, k: int = 5) -> List[Tuple[str, Dict, float]]:
-        """Query the vector database using cosine similarity"""
-        try:
-            # Generate query embedding
-            query_embedding = self._encode([q])[0]
-            
-            with self.engine.connect() as conn:
-                # Use pgvector's cosine similarity operator with proper casting
-                result = conn.execute(
-                    text("""
-                        SELECT content, metadata, 
-                               1 - (embedding <=> CAST(:query_embedding AS vector)) as similarity
-                        FROM documents
-                        ORDER BY embedding <=> CAST(:query_embedding AS vector)
-                        LIMIT :limit
-                    """),
+                    text(sql),
                     {
-                        "query_embedding": query_embedding.tolist(),
-                        "limit": k
+                        "content": text_content,
+                        "source": meta.get("source", ""),
+                        "chunk_index": int(meta.get("chunk", 0)),
                     }
                 )
-                
-                results = []
-                for row in result:
-                    content = row[0]
-                    metadata = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-                    similarity = float(row[2])
-                    results.append((content, metadata, similarity))
-                
-                return results
-        except Exception as e:
-            print(f"[VectorStore] Error querying database: {e}")
-            return []
+        print(f"[VectorStore] Stored {len(texts)} documents")
+        return len(texts), [str(p) for p in files]
+
+    def query(self, q: str, k: int = 5) -> List[Tuple[str, Dict, float]]:
+        q_emb = self._encode([q])[0]
+        q_lit = "[" + ",".join(str(float(x)) for x in q_emb.tolist()) + "]"
+        with self.engine.begin() as conn:
+            sql = f"""
+                  SELECT content, metadata, 1 - (embedding <=> '{q_lit}'::vector) AS similarity
+                  FROM documents
+                  ORDER BY embedding <=> '{q_lit}'::vector
+                  LIMIT :k
+                """
+            rows = conn.execute(text(sql), {"k": k}).fetchall()
+        out = []
+        for content, metadata, sim in rows:
+            meta = metadata if isinstance(metadata, dict) else json.loads(metadata)
+            out.append((content, meta, float(sim)))
+        return out
 
     def get_chunk_count(self) -> int:
-        """Get the total number of chunks in the database"""
-        try:
-            with self.engine.connect() as conn:
-                result = conn.execute(text("SELECT COUNT(*) FROM documents"))
-                return result.scalar()
-        except Exception as e:
-            print(f"[VectorStore] Error getting chunk count: {e}")
-            return 0
+        with self.engine.begin() as conn:
+            return int(conn.execute(text("SELECT COUNT(*) FROM documents")).scalar() or 0)
 
 
 store = VectorStore()
-store.ingest_folder(DATA_DIR)
+# Do not auto-ingest at startup; call /ingest explicitly after DB is ready
 
 # ---------- LiteLLM-style LLM selection for CrewAI ----------
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -247,50 +208,49 @@ class ChatRequest(BaseModel):
     stream: bool | None = False
     temperature: float | None = 0.2
 
+import httpx
+
 @app.post("/v1/chat/completions")
-def chat_completions(req: ChatRequest):
-    # Extract the latest user question
+async def chat_completions(req: ChatRequest):
     user_msgs = [m.content for m in req.messages if m.role == "user"]
     if not user_msgs:
         raise HTTPException(400, "No user message provided")
     question = user_msgs[-1]
 
-    # Retrieve context (reuse your pipeline)
+    # retrieve top-k
     results = store.query(question, k=5)
-    if not results:
-        context_text = "No local documents ingested. Use /ingest or add files to data/."
-    else:
-        context_lines = []
-        for text, meta, score in results:
-            src = f"{meta.get('source')}#chunk-{meta.get('chunk')}"
-            context_lines.append(f"[source: {src}, score: {score:.3f}]\n{text}")
-        context_text = "\n\n".join(context_lines)
-
-    instructions = (
-        "You are given a user question and retrieved context.\n"
-        "Answer ONLY using the context; cite sources like [file#chunk-N]. "
-        "If insufficient, say so.\n\n"
-        f"Question:\n{question}\n\nContext:\n{context_text}\n"
+    context = "No local documents ingested." if not results else "\n\n".join(
+        f"[source: {m.get('source')}#chunk-{m.get('chunk')}, score: {s:.3f}]\n{t}"
+        for t, m, s in results
+    )
+    prompt = (
+        "Answer ONLY from the context, cite like [file#chunk-N]. If insufficient, say so.\n\n"
+        f"Question:\n{question}\n\nContext:\n{context}\n"
     )
 
-    task = Task(description=instructions, agent=rag_agent, expected_output="A sourced answer.")
-    crew = Crew(agents=[rag_agent], tasks=[task], process=Process.sequential)
-    answer = str(crew.kickoff())
+    payload = {
+        "model": os.getenv("OLLAMA_MODEL", "llama3.2"),
+        "messages": [{"role":"user","content":prompt}],
+        "stream": False,
+        "options": {"temperature": req.temperature or 0.2}
+    }
+    async with httpx.AsyncClient(timeout=None) as client:
+        r = await client.post(f"{os.getenv('OLLAMA_BASE_URL','http://ollama:11434')}/api/chat", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        text = (data.get("message") or {}).get("content", "")
 
-    # OpenAI-like response
-    now = int(datetime.utcnow().timestamp())
+    from datetime import datetime
     return {
-        "id": "chatcmpl-rag-1",
+        "id": "chatcmpl-ollama-rag",
         "object": "chat.completion",
-        "created": now,
-        "model": "crew-rag",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": answer},
-            "finish_reason": "stop"
-        }],
+        "created": int(datetime.utcnow().timestamp()),
+        "model": payload["model"],
+        "choices": [{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
+
+
 
 class AskRequest(BaseModel):
     question: str
@@ -339,79 +299,15 @@ def ask(body: AskRequest):
 
     return {"answer": answer, "context": context_text}
 
-@app.post("/ask-simple")
-def ask_simple(body: AskRequest):
-    print(f"[DEBUG] Simple ask - Received question: {body.question}")
-    question = (body.question or "").strip()
-    if not question:
-        raise HTTPException(400, "question is required")
-
-    print(f"[DEBUG] Starting vector query...")
-    # retrieve
-    results = store.query(question, k=body.top_k or 5)
-    print(f"[DEBUG] Vector query completed, found {len(results)} results")
-    context_text = "No local documents ingested. Use /ingest or add files to data/."
-    if results:
-        context_text = "\n\n".join(
-            f"[source: {m.get('source')}#chunk-{m.get('chunk')}, score: {score:.3f}]\n{text}"
-            for text, m, score in results
-        )
-
-    # Simple response for testing
-    answer = f"Based on the context: {context_text[:200]}..."
-    print(f"[DEBUG] Returning simple answer: {answer[:100]}...")
-
-    return {"answer": answer, "context": context_text}
-
-@app.post("/ask-old")
-def ask_old(body: AskRequest):
-    print(f"[DEBUG] Received question: {body.question}")
-    question = (body.question or "").strip()
-    if not question:
-        raise HTTPException(400, "question is required")
-
-    print(f"[DEBUG] Starting vector query...")
-    # retrieve
-    results = store.query(question, k=body.top_k or 5)
-    print(f"[DEBUG] Vector query completed, found {len(results)} results")
-    context_text = "No local documents ingested. Use /ingest or add files to data/."
-    if results:
-        context_text = "\n\n".join(
-            f"[source: {m.get('source')}#chunk-{m.get('chunk')}, score: {score:.3f}]\n{text}"
-            for text, m, score in results
-        )
-
-    instructions = (
-        "Answer ONLY using the context; cite as [file#chunk-N]. "
-        "If insufficient, say so.\n\n"
-        f"Question:\n{question}\n\nContext:\n{context_text}\n"
-    )
-
-    task = Task(description=instructions, agent=rag_agent, expected_output="A sourced answer.")
-    crew = Crew(agents=[rag_agent], tasks=[task], process=Process.sequential)
-
-    try:
-        # timeout to avoid long hangs on LLM/backends
-        answer = asyncio.run(asyncio.wait_for(
-            asyncio.to_thread(lambda: str(crew.kickoff())), timeout=45
-        ))
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="LLM timed out")
-    except Exception as e:
-        # surface the root cause (e.g., Ollama connection refused)
-        raise HTTPException(status_code=502, detail=f"LLM backend error: {e}")
-
-    return {"answer": answer, "context": context_text}
+ 
 
 @app.get("/v1/models")
 def list_models():
     return {
         "object": "list",
-        "data": [{
-            "id": "crew-rag",
-            "object": "model",
-            "owned_by": "local",
-        }]
+        "data": [
+            {"id": "crew-rag222", "object": "model", "owned_by": "local"},
+        ]
     }
 
 @app.get("/health")
