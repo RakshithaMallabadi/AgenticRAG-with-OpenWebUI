@@ -350,10 +350,11 @@ def ingest_documents(folder: Path = DATA_DIR, patterns: tuple = ("*.txt", "*.md"
     print(f"[LlamaIndex] Ingested {len(nodes)} contextually-enhanced chunks")
     return len(nodes), [str(p) for p in files]
 
-# ---------- CrewAI Agent ----------
+# ---------- CrewAI Agents ----------
 llm_model = f"ollama/{OLLAMA_MODEL}"
 os.environ.setdefault("OLLAMA_API_BASE", OLLAMA_BASE)
 
+# Legacy single agent (kept for compatibility)
 rag_agent = Agent(
     role="RAG Answerer",
     goal=(
@@ -367,6 +368,138 @@ rag_agent = Agent(
     llm=llm_model,
     verbose=False,
 )
+
+# ---------- Multi-Agent CrewAI System ----------
+
+def create_rag_crew(question: str, retrieved_context: str) -> Crew:
+    """
+    Create a CrewAI crew for advanced RAG question answering.
+    
+    This creates a three-agent system:
+    1. Research Agent - Analyzes and extracts information from documents
+    2. Synthesis Agent - Creates comprehensive, accurate answers
+    3. Quality Agent - Validates answer quality and completeness
+    """
+    
+    # Research Agent - Analyzes retrieved documents
+    research_agent = Agent(
+        role='Document Research Specialist',
+        goal='Analyze retrieved documents and extract all relevant information including names, dates, organizations, and facts',
+        backstory="""You are an expert document analyst with exceptional attention to detail. 
+        You excel at identifying and extracting specific information like full names (with titles), 
+        organizations, dates, numbers, and key relationships from source documents. You never 
+        generalize when specific details are available.""",
+        verbose=True,
+        allow_delegation=False,
+        llm=llm_model,
+    )
+    
+    # Synthesis Agent - Creates comprehensive answers
+    synthesis_agent = Agent(
+        role='Information Synthesis Expert',
+        goal='Synthesize extracted information into clear, accurate, and well-cited answers',
+        backstory="""You are a skilled communicator who transforms analyzed data into clear, 
+        concise answers. You always include specific details (names with titles, complete 
+        organization names, exact dates) and cite sources properly. You are faithful to the 
+        source material and never add information not present in the documents.""",
+        verbose=True,
+        allow_delegation=False,
+        llm=llm_model,
+    )
+    
+    # Quality Agent - Validates answers
+    quality_agent = Agent(
+        role='Quality Assurance Specialist',
+        goal='Ensure answers are accurate, complete, well-cited, and include all necessary specific details',
+        backstory="""You are meticulous about quality and accuracy. You verify that answers 
+        include all key details (full names with titles, complete organization names, specific 
+        dates), proper citations, and are completely faithful to source documents. You identify 
+        any missing information or areas needing improvement.""",
+        verbose=True,
+        allow_delegation=False,
+        llm=llm_model,
+    )
+    
+    # Task 1: Research and extract information
+    research_task = Task(
+        description=f"""Analyze the following retrieved documents to answer: "{question}"
+
+Retrieved Context:
+{retrieved_context}
+
+Your task is to extract ALL relevant information including:
+- Full names with titles (e.g., H.E., Dr., Chairman, etc.)
+- Complete organization names and departments
+- Specific dates, version numbers, and other numerical data
+- Key facts, roles, and relationships
+- Direct quotes if helpful
+
+Provide a structured analysis with all extracted details.""",
+        agent=research_agent,
+        expected_output="Detailed structured analysis of all relevant information from the source documents with specific names, titles, organizations, and dates"
+    )
+    
+    # Task 2: Synthesize into answer
+    synthesis_task = Task(
+        description=f"""Using the research analysis, create a comprehensive answer to: "{question}"
+
+Your answer MUST:
+- Include specific details: full names WITH titles, complete organization names, exact dates
+- Be clear and well-structured
+- Cite sources appropriately
+- Be completely faithful to the source documents
+- Never generalize when specific details exist
+
+Use the research findings to craft your response with precision.""",
+        agent=synthesis_agent,
+        expected_output="Clear, precise answer with all specific details (names with titles, organizations, dates) and proper source citations",
+        context=[research_task]
+    )
+    
+    # Task 3: Quality check and improvement
+    quality_task = Task(
+        description="""Review the synthesized answer for:
+
+1. **Accuracy**: Is it faithful to source documents? No invented facts?
+2. **Completeness**: Includes all key details (full names with titles, complete org names, exact dates)?
+3. **Specificity**: Are specific details used instead of generalizations?
+4. **Citations**: Are sources properly referenced?
+5. **Clarity**: Is it easy to understand?
+
+If the answer is missing specific details that were in the research (like full names, titles, or organizations), 
+ADD them to improve the answer. Otherwise, approve and return the final polished answer.""",
+        agent=quality_agent,
+        expected_output="Final quality-checked and improved answer with all specific details, proper citations, and verified accuracy",
+        context=[synthesis_task]
+    )
+    
+    # Create and return the crew with sequential process
+    crew = Crew(
+        agents=[research_agent, synthesis_agent, quality_agent],
+        tasks=[research_task, synthesis_task, quality_task],
+        process=Process.sequential,
+        verbose=True,
+    )
+    
+    return crew
+
+
+def run_crewai_rag(question: str, retrieved_context: str) -> str:
+    """
+    Run the CrewAI multi-agent RAG workflow and return the final answer.
+    
+    This orchestrates three agents working sequentially to produce
+    high-quality, validated answers with proper citations.
+    """
+    try:
+        print(f"[CrewAI] Starting multi-agent RAG workflow for: {question}")
+        crew = create_rag_crew(question, retrieved_context)
+        result = crew.kickoff()
+        print(f"[CrewAI] Workflow completed successfully")
+        return str(result)
+    except Exception as e:
+        print(f"[CrewAI] Error in workflow: {e}")
+        raise
 
 # ---------- FastAPI ----------
 app = FastAPI(title="LlamaIndex RAG (FastAPI + CrewAI)")
@@ -413,10 +546,12 @@ def root():
             "contextual_rag": True,
             "reranking": True,
             "citations": True,
+            "crewai_multi_agent": True,
             "document_processing": "Docling",
         },
         "endpoints": {
             "ask": "POST /ask - Stateless RAG queries with re-ranking",
+            "ask_crewai": "POST /ask-crewai - Multi-agent CrewAI RAG (research + synthesis + quality validation)",
             "chat": "POST /chat - Conversational RAG with memory",
             "chat_history": "GET /chat/history/{session_id} - View conversation history",
             "chat_clear": "POST /chat/clear - Clear specific session history",
@@ -424,7 +559,12 @@ def root():
             "ingest": "POST /ingest - Ingest documents into vector store",
             "health": "GET /health - System health check"
         },
-        "active_sessions": len(chat_sessions)
+        "active_sessions": len(chat_sessions),
+        "crewai": {
+            "enabled": True,
+            "agents": ["research_specialist", "synthesis_expert", "quality_assurance"],
+            "workflow": "sequential"
+        }
     }
 
 @app.post("/ingest")
@@ -678,17 +818,122 @@ Use the [number] references to cite specific sources."""
         "reranker_type": "cohere" if _HAS_COHERE and os.getenv("COHERE_API_KEY") else "similarity"
     }
 
+@app.post("/ask-crewai")
+def ask_with_crewai(body: AskRequest):
+    """
+    CrewAI-powered RAG endpoint with multi-agent orchestration.
+    
+    This endpoint uses a crew of three specialized agents working sequentially:
+    1. Research Agent - Analyzes documents and extracts detailed information
+    2. Synthesis Agent - Creates comprehensive, accurate answers
+    3. Quality Agent - Validates and improves output quality
+    
+    This provides more thorough, validated answers compared to direct LLM calls,
+    especially useful for complex or important questions requiring high accuracy.
+    
+    Pipeline:
+    1. Retrieve initial candidates using vector similarity
+    2. Re-rank using Cohere or similarity-based reranker
+    3. Pass to CrewAI multi-agent system for processing
+    4. Return quality-validated answer with citations
+    """
+    print(f"[CrewAI RAG] Received question: {body.question}")
+    question = (body.question or "").strip()
+    if not question:
+        raise HTTPException(400, "question is required")
+    
+    # Step 1: Retrieve initial candidates (over-fetch for re-ranking)
+    initial_top_k = (body.top_k or 5) * 2
+    retriever = VectorIndexRetriever(
+        index=index,
+        similarity_top_k=initial_top_k,
+    )
+    
+    nodes = retriever.retrieve(question)
+    print(f"[CrewAI RAG] Retrieved {len(nodes)} initial candidates")
+    
+    # Step 2: Re-rank the nodes
+    try:
+        reranked_nodes = reranker.postprocess_nodes(
+            nodes=nodes,
+            query_str=question,
+        )
+        print(f"[CrewAI RAG] Re-ranked to {len(reranked_nodes)} nodes")
+    except Exception as e:
+        print(f"[CrewAI RAG] Re-ranking failed: {e}, using original nodes")
+        reranked_nodes = nodes[:body.top_k or 5]
+    
+    # Step 3: Format context for CrewAI agents
+    context_parts = []
+    citations = []
+    
+    for i, node in enumerate(reranked_nodes[:body.top_k or 5]):
+        source = node.metadata.get("source", "unknown")
+        file_path = node.metadata.get("file_path", "")
+        score = node.score if hasattr(node, 'score') else 0.0
+        
+        # Create citation
+        citation = {
+            "index": i + 1,
+            "source": source,
+            "file_path": file_path,
+            "score": float(score),
+            "text_preview": node.text[:200] + "..." if len(node.text) > 200 else node.text
+        }
+        citations.append(citation)
+        
+        # Format context with source info
+        context_parts.append(
+            f"[Source {i+1}] {source} (Relevance: {score:.3f})\n{node.text}\n"
+        )
+    
+    retrieved_context = "\n\n".join(context_parts)
+    
+    # Step 4: Run CrewAI multi-agent workflow
+    try:
+        print(f"[CrewAI RAG] Starting multi-agent workflow...")
+        crewai_answer = run_crewai_rag(question, retrieved_context)
+        
+        # Add source citations at the end if not already present
+        if "**Sources:**" not in crewai_answer:
+            citations_text = "\n\n**Sources:**\n" + "\n".join([
+                f"[{i+1}] {node.metadata.get('source', 'unknown')} (relevance: {node.score if hasattr(node, 'score') else 0.0:.2f})"
+                for i, node in enumerate(reranked_nodes[:body.top_k or 5])
+            ])
+            final_answer = crewai_answer + citations_text
+        else:
+            final_answer = crewai_answer
+        
+        return {
+            "answer": final_answer,
+            "retrieved_nodes": len(reranked_nodes),
+            "method": "crewai_multi_agent",
+            "agents_used": ["research_specialist", "synthesis_expert", "quality_assurance"],
+            "workflow": "sequential",
+            "citations": citations,
+            "reranked": True,
+            "reranker_type": "cohere" if _HAS_COHERE and os.getenv("COHERE_API_KEY") else "similarity"
+        }
+        
+    except Exception as e:
+        print(f"[CrewAI RAG] Workflow failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"CrewAI workflow failed: {str(e)}")
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
     """
-    OpenAI-compatible chat completions endpoint with conversation memory.
+    OpenAI-compatible chat completions endpoint with CrewAI multi-agent system.
     
-    This endpoint wraps the /chat logic to provide:
-    - Conversation memory
-    - Contextual RAG with re-ranking
-    - Citation handling
+    This endpoint provides OpenWebUI with:
+    - CrewAI Multi-Agent Orchestration (Research + Synthesis + Quality)
+    - Conversation Memory (persistent across turns)
+    - Contextual RAG with Re-ranking
+    - Citation Handling
+    - Fallback to direct LLM if CrewAI fails
     
-    OpenWebUI calls this endpoint and gets full RAG capabilities.
+    OpenWebUI calls this endpoint and gets full multi-agent RAG capabilities.
     """
     user_msgs = [m.content for m in req.messages if m.role == "user"]
     if not user_msgs:
@@ -763,57 +1008,80 @@ async def chat_completions(req: ChatRequest):
             f"**[{i+1}]** {source} (relevance: {score:.2f})\n{node.text}\n"
         )
     
-    # Generate conversational answer with citations
+    # Generate conversational answer with CrewAI multi-agent system
     if context_parts:
         context_text = "\n\n".join(context_parts)
         
-        # Build a concise context for LLM (show more text for better accuracy)
-        simple_context = "\n\n".join([
-            f"Source {i+1}: {node.text[:1000]}" 
-            for i, node in enumerate(reranked_nodes[:5])
-        ])
+        # Format context for CrewAI agents with conversation history
+        crewai_context_parts = []
+        for i, node in enumerate(reranked_nodes[:5]):
+            source = node.metadata.get("source", "unknown")
+            score = node.score if hasattr(node, 'score') else 0.0
+            crewai_context_parts.append(
+                f"[Source {i+1}] {source} (Relevance: {score:.3f})\n{node.text}\n"
+            )
         
-        # Create prompt for LLM to generate answer
+        # Add conversation context if exists
         conversation_context = ""
         if len(chat_history) > 2:
             recent_msgs = [msg for msg in chat_history[:-1]][-4:]
-            conversation_context = "Previous conversation:\n" + "\n".join([
-                f"{msg.role}: {msg.content[:150]}" 
+            conversation_context = "\n\n**Previous Conversation Context:**\n" + "\n".join([
+                f"{msg.role}: {msg.content[:200]}" 
                 for msg in recent_msgs
             ]) + "\n\n"
         
-        prompt = f"""{conversation_context}Context from documents:
+        retrieved_context = conversation_context + "\n\n".join(crewai_context_parts)
+        
+        # Use CrewAI multi-agent workflow for high-quality answers
+        try:
+            print(f"[OpenWebUI CrewAI] Starting multi-agent workflow...")
+            crewai_answer = run_crewai_rag(question, retrieved_context)
+            
+            # Add source citations if not already present
+            if "**Sources:**" not in crewai_answer:
+                citations_text = "\n\n**Sources:**\n" + "\n".join([
+                    f"[{i+1}] {node.metadata.get('source', 'unknown')} (relevance: {node.score if hasattr(node, 'score') else 0.0:.2f})"
+                    for i, node in enumerate(reranked_nodes[:5])
+                ])
+                answer = crewai_answer + citations_text
+            else:
+                answer = crewai_answer
+            
+            print(f"[OpenWebUI CrewAI] Workflow completed successfully")
+            
+        except Exception as e:
+            print(f"[OpenWebUI CrewAI] Workflow failed: {e}, falling back to direct LLM")
+            # Fallback to direct LLM if CrewAI fails
+            try:
+                from llama_index.core.llms import ChatMessage as LLMChatMsg
+                
+                simple_context = "\n\n".join([
+                    f"Source {i+1}: {node.text[:1000]}" 
+                    for i, node in enumerate(reranked_nodes[:5])
+                ])
+                
+                prompt = f"""{conversation_context}Context from documents:
 {simple_context}
 
 Question: {question}
 
-Please provide a clear, accurate answer based ONLY on the information in the context above. Extract specific details like names, organizations, dates, and titles exactly as they appear in the documents. Reference source numbers when appropriate."""
-        
-        # Generate answer using LLM
-        try:
-            from llama_index.core import PromptTemplate
-            from llama_index.core.llms import ChatMessage as LLMChatMsg
-            
-            # Use the LLM to generate a response
-            response = llm.chat([
-                LLMChatMsg(role="system", content="You are a precise document analyst. Extract EXACT information from documents:\n• Include full names with titles (H.E., Dr., etc.)\n• Include complete organization names\n• Include specific dates, numbers, and roles\n• Quote directly from source when possible\n• Never generalize if specific details exist in the context"),
-                LLMChatMsg(role="user", content=prompt)
-            ])
-            
-            llm_answer = str(response.message.content)
-            
-            # Add source citations at the end
-            citations_text = "\n\n**Sources:**\n" + "\n".join([
-                f"[{i+1}] {node.metadata.get('source', 'unknown')} (relevance: {node.score if hasattr(node, 'score') else 0.0:.2f})"
-                for i, node in enumerate(reranked_nodes[:5])
-            ])
-            
-            answer = llm_answer + citations_text
-            
-        except Exception as e:
-            print(f"[OpenWebUI] LLM generation failed: {e}, returning context")
-            # Fallback to context-based answer
-            answer = f"""Based on the retrieved documents:
+Please provide a clear, accurate answer based ONLY on the information in the context above."""
+                
+                response = llm.chat([
+                    LLMChatMsg(role="system", content="You are a precise document analyst. Extract EXACT information from documents."),
+                    LLMChatMsg(role="user", content=prompt)
+                ])
+                
+                llm_answer = str(response.message.content)
+                citations_text = "\n\n**Sources:**\n" + "\n".join([
+                    f"[{i+1}] {node.metadata.get('source', 'unknown')} (relevance: {node.score if hasattr(node, 'score') else 0.0:.2f})"
+                    for i, node in enumerate(reranked_nodes[:5])
+                ])
+                answer = llm_answer + citations_text
+                
+            except Exception as e2:
+                print(f"[OpenWebUI] Fallback LLM also failed: {e2}, returning context")
+                answer = f"""Based on the retrieved documents:
 
 {context_text}
 
