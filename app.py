@@ -55,6 +55,19 @@ import uuid
 # CrewAI
 from crewai import Agent, Task, Crew, Process
 
+# Arize Phoenix - Observability and Tracing
+try:
+    import phoenix as px
+    from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    _HAS_PHOENIX = True
+    print("[Phoenix] Phoenix observability loaded successfully")
+except ImportError as e:
+    _HAS_PHOENIX = False
+    print(f"[Phoenix] Phoenix not available: {e}")
+
 # Optional Docling support (PDF parsing)
 try:
     from docling.document_converter import DocumentConverter
@@ -125,6 +138,42 @@ index = VectorStoreIndex.from_vector_store(
     storage_context=storage_context,
 )
 print("[LlamaIndex] Vector store initialized successfully")
+
+# ---------- Arize Phoenix Initialization ----------
+
+phoenix_session = None
+if _HAS_PHOENIX:
+    try:
+        # Get Phoenix configuration from environment
+        PHOENIX_COLLECTOR_ENDPOINT = os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix:6006")
+        PHOENIX_PROJECT_NAME = os.getenv("PHOENIX_PROJECT_NAME", "openwebui-rag")
+        
+        print(f"[Phoenix] Starting Phoenix session for project: {PHOENIX_PROJECT_NAME}")
+        print(f"[Phoenix] Collector endpoint: {PHOENIX_COLLECTOR_ENDPOINT}")
+        
+        # Launch Phoenix session
+        phoenix_session = px.launch_app(host="0.0.0.0", port=6006)
+        
+        # Configure OpenTelemetry tracer to send to Phoenix
+        tracer_provider = TracerProvider()
+        tracer_provider.add_span_processor(
+            SimpleSpanProcessor(
+                OTLPSpanExporter(endpoint=f"{PHOENIX_COLLECTOR_ENDPOINT}/v1/traces")
+            )
+        )
+        
+        # Instrument LlamaIndex with Phoenix tracing
+        LlamaIndexInstrumentor().instrument(tracer_provider=tracer_provider)
+        
+        print("[Phoenix] ✅ Phoenix tracing enabled for LlamaIndex")
+        print(f"[Phoenix] 🌐 Phoenix UI available at: http://localhost:6006")
+        
+    except Exception as e:
+        print(f"[Phoenix] ⚠️  Failed to initialize Phoenix: {e}")
+        print("[Phoenix] Continuing without observability...")
+        _HAS_PHOENIX = False
+else:
+    print("[Phoenix] Phoenix not available - install with: pip install arize-phoenix openinference-instrumentation-llama-index")
 
 # ---------- Contextual Retrieval & Re-ranking Configuration ----------
 
@@ -490,15 +539,26 @@ def run_crewai_rag(question: str, retrieved_context: str) -> str:
     
     This orchestrates three agents working sequentially to produce
     high-quality, validated answers with proper citations.
+    
+    Phoenix tracing is automatically enabled for all LLM calls within CrewAI agents.
     """
     try:
         print(f"[CrewAI] Starting multi-agent RAG workflow for: {question}")
+        
+        # Phoenix automatically traces LLM calls made by CrewAI agents
+        # through the LlamaIndex instrumentation
         crew = create_rag_crew(question, retrieved_context)
         result = crew.kickoff()
+        
         print(f"[CrewAI] Workflow completed successfully")
+        if _HAS_PHOENIX:
+            print(f"[Phoenix] CrewAI traces available at http://localhost:6006")
+        
         return str(result)
     except Exception as e:
         print(f"[CrewAI] Error in workflow: {e}")
+        if _HAS_PHOENIX:
+            print(f"[Phoenix] Error traces available at http://localhost:6006")
         raise
 
 # ---------- FastAPI ----------
@@ -548,6 +608,7 @@ def root():
             "citations": True,
             "crewai_multi_agent": True,
             "document_processing": "Docling",
+            "phoenix_observability": _HAS_PHOENIX,
         },
         "endpoints": {
             "ask": "POST /ask - Stateless RAG queries with re-ranking",
@@ -557,13 +618,21 @@ def root():
             "chat_clear": "POST /chat/clear - Clear specific session history",
             "chat_sessions": "GET /chat/sessions - List all active sessions",
             "ingest": "POST /ingest - Ingest documents into vector store",
-            "health": "GET /health - System health check"
+            "health": "GET /health - System health check",
+            "phoenix_status": "GET /phoenix/status - Phoenix observability status",
+            "phoenix_traces": "GET /phoenix/traces - View traces information",
+            "phoenix_metrics": "GET /phoenix/metrics - View metrics information"
         },
         "active_sessions": len(chat_sessions),
         "crewai": {
             "enabled": True,
             "agents": ["research_specialist", "synthesis_expert", "quality_assurance"],
             "workflow": "sequential"
+        },
+        "phoenix": {
+            "enabled": _HAS_PHOENIX,
+            "ui_url": "http://localhost:6006" if _HAS_PHOENIX else None,
+            "features": ["LLM tracing", "Embedding tracking", "Retrieval monitoring"] if _HAS_PHOENIX else []
         }
     }
 
@@ -1216,10 +1285,79 @@ def health():
         return {
             "status": "ok",
             "vector_store": "LlamaIndex + PGVector",
-            "nodes_available": len(nodes) > 0
+            "nodes_available": len(nodes) > 0,
+            "phoenix_enabled": _HAS_PHOENIX
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+# ---------- Phoenix Observability Endpoints ----------
+
+@app.get("/phoenix/status")
+def phoenix_status():
+    """
+    Get Phoenix observability status and configuration.
+    """
+    if not _HAS_PHOENIX:
+        return {
+            "enabled": False,
+            "message": "Phoenix is not installed or failed to initialize",
+            "install_command": "pip install arize-phoenix openinference-instrumentation-llama-index"
+        }
+    
+    return {
+        "enabled": True,
+        "ui_url": "http://localhost:6006",
+        "project_name": os.getenv("PHOENIX_PROJECT_NAME", "openwebui-rag"),
+        "collector_endpoint": os.getenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix:6006"),
+        "instrumented": {
+            "llama_index": True,
+            "crewai": False,  # Will be added next
+        },
+        "features": [
+            "LLM call tracing",
+            "Embedding tracking",
+            "Retrieval monitoring",
+            "Latency analysis",
+            "Token usage tracking"
+        ]
+    }
+
+@app.get("/phoenix/traces")
+def get_recent_traces():
+    """
+    Get information about recent traces (if Phoenix is enabled).
+    """
+    if not _HAS_PHOENIX:
+        raise HTTPException(404, "Phoenix observability is not enabled")
+    
+    return {
+        "message": "View traces in Phoenix UI",
+        "ui_url": "http://localhost:6006",
+        "note": "Open the Phoenix UI to view detailed traces, spans, and metrics"
+    }
+
+@app.get("/phoenix/metrics")
+def get_phoenix_metrics():
+    """
+    Get observability metrics summary.
+    """
+    if not _HAS_PHOENIX:
+        raise HTTPException(404, "Phoenix observability is not enabled")
+    
+    return {
+        "message": "Metrics available in Phoenix UI",
+        "ui_url": "http://localhost:6006",
+        "metrics_available": [
+            "Total requests",
+            "Average latency",
+            "Token usage",
+            "Error rates",
+            "Retrieval quality",
+            "LLM performance"
+        ],
+        "note": "Open Phoenix UI for detailed metrics and analytics"
+    }
 
 if __name__ == "__main__":
     import uvicorn

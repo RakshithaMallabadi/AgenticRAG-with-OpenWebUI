@@ -44,6 +44,7 @@ services:
     command: uvicorn app:app --host 0.0.0.0 --port 4000 --reload
     ports:
       - "4000:4000"
+      - "6006:6006"  # Phoenix UI
     environment:
       - PYTHONUNBUFFERED=1
       - TRANSFORMERS_NO_TF=1
@@ -53,6 +54,9 @@ services:
       - OLLAMA_MODEL=llama3.2:1b
       # PostgreSQL connection
       - DATABASE_URL=postgresql://raguser:ragpass@postgres-vector:5432/ragdb
+      # Arize Phoenix configuration
+      - PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006
+      - PHOENIX_PROJECT_NAME=openwebui-rag
     depends_on:
       postgres:
         condition: service_healthy
