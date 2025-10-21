@@ -77,6 +77,24 @@ except Exception as e:
     DocumentConverter = None
     _HAS_DOCLING = False
 
+# RAGAs - Evaluation Framework
+try:
+    from ragas import evaluate
+    from ragas.metrics import (
+        faithfulness,
+        answer_relevancy,
+        context_precision,
+        context_recall,
+    )
+    from ragas.llms import LlamaIndexLLMWrapper
+    from ragas.embeddings import LlamaIndexEmbeddingsWrapper
+    from datasets import Dataset
+    _HAS_RAGAS = True
+    print("[RAGAs] RAGAs evaluation framework loaded successfully")
+except ImportError as e:
+    _HAS_RAGAS = False
+    print(f"[RAGAs] RAGAs not available: {e}")
+
 load_dotenv()
 
 # ---------- Paths ----------
@@ -208,6 +226,23 @@ response_synthesizer = get_response_synthesizer(
     response_mode="compact",
     use_async=False,
 )
+
+# ---------- RAGAs Configuration ----------
+
+ragas_llm = None
+ragas_embeddings = None
+
+if _HAS_RAGAS:
+    try:
+        # Wrap LlamaIndex LLM and embeddings for RAGAs
+        ragas_llm = LlamaIndexLLMWrapper(llm)
+        ragas_embeddings = LlamaIndexEmbeddingsWrapper(embed_model)
+        print("[RAGAs] RAGAs evaluators configured successfully")
+    except Exception as e:
+        print(f"[RAGAs] Failed to configure RAGAs: {e}")
+        _HAS_RAGAS = False
+else:
+    print("[RAGAs] RAGAs not available - install with: pip install ragas datasets")
 
 # ---------- Conversation Memory ----------
 
@@ -344,14 +379,14 @@ def add_contextual_metadata(documents: List[Document]) -> List[Document]:
 # ---------- Ingestion Function ----------
 def ingest_documents(folder: Path = DATA_DIR, patterns: tuple = ("*.txt", "*.md", "*.pdf")):
     """Ingest documents using LlamaIndex with contextual enhancement"""
-    folder = Path(folder).resolve()
+        folder = Path(folder).resolve()
     files = []
-    for pat in patterns:
-        files.extend(sorted(folder.rglob(pat)))
+        for pat in patterns:
+            files.extend(sorted(folder.rglob(pat)))
 
     documents = []
-    for p in files:
-        try:
+        for p in files:
+            try:
             text = _read_text_from_path(p)
             if not text or not text.strip():
                 continue
@@ -367,12 +402,12 @@ def ingest_documents(folder: Path = DATA_DIR, patterns: tuple = ("*.txt", "*.md"
             )
             documents.append(doc)
             print(f"[Ingest] Added document: {p.name}")
-        except Exception as e:
-            print(f"[ingest] skip {p}: {e}")
-            continue
+            except Exception as e:
+                print(f"[ingest] skip {p}: {e}")
+                continue
 
     if not documents:
-        return 0, [str(p) for p in files]
+            return 0, [str(p) for p in files]
 
     # Add contextual metadata (Anthropic-style)
     print(f"[Contextual RAG] Adding contextual metadata to {len(documents)} documents")
@@ -400,10 +435,14 @@ def ingest_documents(folder: Path = DATA_DIR, patterns: tuple = ("*.txt", "*.md"
     return len(nodes), [str(p) for p in files]
 
 # ---------- CrewAI Agents ----------
-llm_model = f"ollama/{OLLAMA_MODEL}"
+# Set environment variables for CrewAI
 os.environ.setdefault("OLLAMA_API_BASE", OLLAMA_BASE)
 
-# Legacy single agent (kept for compatibility)
+# Initialize CrewAI agents only if LLM is available
+rag_agent = None
+if llm is not None:
+    try:
+        # Legacy single agent (kept for compatibility)
 rag_agent = Agent(
     role="RAG Answerer",
     goal=(
@@ -414,9 +453,15 @@ rag_agent = Agent(
         "You are a careful analyst. You never invent facts. You keep answers concise "
         "and always include exact sources from the provided context."
     ),
-    llm=llm_model,
+            llm=llm,
     verbose=False,
 )
+        print("[CrewAI] Single agent initialized successfully")
+    except Exception as e:
+        print(f"[CrewAI] Failed to initialize single agent: {e}")
+        rag_agent = None
+else:
+    print("[CrewAI] LLM not available, skipping agent initialization")
 
 # ---------- Multi-Agent CrewAI System ----------
 
@@ -440,7 +485,7 @@ def create_rag_crew(question: str, retrieved_context: str) -> Crew:
         generalize when specific details are available.""",
         verbose=True,
         allow_delegation=False,
-        llm=llm_model,
+        llm=llm,
     )
     
     # Synthesis Agent - Creates comprehensive answers
@@ -453,7 +498,7 @@ def create_rag_crew(question: str, retrieved_context: str) -> Crew:
         source material and never add information not present in the documents.""",
         verbose=True,
         allow_delegation=False,
-        llm=llm_model,
+        llm=llm,
     )
     
     # Quality Agent - Validates answers
@@ -466,7 +511,7 @@ def create_rag_crew(question: str, retrieved_context: str) -> Crew:
         any missing information or areas needing improvement.""",
         verbose=True,
         allow_delegation=False,
-        llm=llm_model,
+        llm=llm,
     )
     
     # Task 1: Research and extract information
@@ -593,6 +638,88 @@ class ChatHistoryRequest(BaseModel):
 class ClearHistoryRequest(BaseModel):
     session_id: str
 
+class EvaluateRequest(BaseModel):
+    """Request model for RAGAs batch evaluation"""
+    questions: List[str]
+    ground_truths: List[str] | None = None  # Optional reference answers
+    contexts: List[List[str]] | None = None  # Optional pre-retrieved contexts
+    top_k: int | None = 5
+
+# ---------- RAGAs Evaluation Helper Functions ----------
+
+def evaluate_rag_response(
+    question: str, 
+    answer: str, 
+    contexts: List[str],
+    ground_truth: str | None = None
+) -> Dict[str, float]:
+    """
+    Evaluate a single RAG response using RAGAs metrics.
+    
+    Args:
+        question: The user's question
+        answer: The generated answer
+        contexts: List of retrieved context strings
+        ground_truth: Optional reference answer for comparison
+    
+    Returns:
+        Dictionary of metric scores (0-1, higher is better)
+    """
+    if not _HAS_RAGAS:
+        return {"error": "RAGAs not available"}
+    
+    try:
+        # Create dataset for evaluation
+        data = {
+            "question": [question],
+            "answer": [answer],
+            "contexts": [contexts],
+        }
+        
+        # Add ground truth if provided
+        if ground_truth:
+            data["ground_truth"] = [ground_truth]
+        
+        dataset = Dataset.from_dict(data)
+        
+        # Select metrics based on available data
+        metrics = [
+            faithfulness,
+            answer_relevancy,
+            context_precision,
+        ]
+        
+        # Add context_recall only if ground_truth is provided
+        if ground_truth:
+            metrics.append(context_recall)
+        
+        print(f"[RAGAs] Running evaluation with {len(metrics)} metrics...")
+        
+        # Run evaluation
+        result = evaluate(
+            dataset=dataset,
+            metrics=metrics,
+            llm=ragas_llm,
+            embeddings=ragas_embeddings,
+        )
+        
+        # Convert to dict with float values
+        scores = {}
+        for metric_name, metric_value in result.items():
+            if isinstance(metric_value, (list, tuple)) and len(metric_value) > 0:
+                scores[metric_name] = float(metric_value[0])
+            elif isinstance(metric_value, (int, float)):
+                scores[metric_name] = float(metric_value)
+        
+        print(f"[RAGAs] Evaluation complete: {scores}")
+        return scores
+        
+    except Exception as e:
+        print(f"[RAGAs] Evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
+
 # ---- Endpoints ----
 @app.get("/")
 def root():
@@ -609,6 +736,7 @@ def root():
             "crewai_multi_agent": True,
             "document_processing": "Docling",
             "phoenix_observability": _HAS_PHOENIX,
+            "ragas_evaluation": _HAS_RAGAS,
         },
         "endpoints": {
             "ask": "POST /ask - Stateless RAG queries with re-ranking",
@@ -621,7 +749,10 @@ def root():
             "health": "GET /health - System health check",
             "phoenix_status": "GET /phoenix/status - Phoenix observability status",
             "phoenix_traces": "GET /phoenix/traces - View traces information",
-            "phoenix_metrics": "GET /phoenix/metrics - View metrics information"
+            "phoenix_metrics": "GET /phoenix/metrics - View metrics information",
+            "ragas_status": "GET /ragas/status - RAGAs evaluation status",
+            "evaluate": "POST /evaluate - Evaluate single query with RAGAs metrics",
+            "evaluate_batch": "POST /evaluate/batch - Batch evaluation with RAGAs"
         },
         "active_sessions": len(chat_sessions),
         "crewai": {
@@ -633,6 +764,11 @@ def root():
             "enabled": _HAS_PHOENIX,
             "ui_url": "http://localhost:6006" if _HAS_PHOENIX else None,
             "features": ["LLM tracing", "Embedding tracking", "Retrieval monitoring"] if _HAS_PHOENIX else []
+        },
+        "ragas": {
+            "enabled": _HAS_RAGAS,
+            "metrics": ["faithfulness", "answer_relevancy", "context_precision", "context_recall"] if _HAS_RAGAS else [],
+            "status": "operational" if _HAS_RAGAS and ragas_llm and ragas_embeddings else "not_configured"
         }
     }
 
@@ -910,6 +1046,10 @@ def ask_with_crewai(body: AskRequest):
     question = (body.question or "").strip()
     if not question:
         raise HTTPException(400, "question is required")
+    
+    # Check if LLM is available for CrewAI
+    if llm is None:
+        raise HTTPException(503, "LLM not available. CrewAI requires an active LLM connection.")
     
     # Step 1: Retrieve initial candidates (over-fetch for re-ranking)
     initial_top_k = (body.top_k or 5) * 2
@@ -1357,6 +1497,291 @@ def get_phoenix_metrics():
             "LLM performance"
         ],
         "note": "Open Phoenix UI for detailed metrics and analytics"
+    }
+
+# ---------- RAGAs Evaluation Endpoints ----------
+
+@app.get("/ragas/status")
+def ragas_status():
+    """
+    Get RAGAs evaluation framework status.
+    
+    Returns configuration and available metrics.
+    """
+    if not _HAS_RAGAS:
+        return {
+            "enabled": False,
+            "message": "RAGAs is not installed or failed to load",
+            "install_command": "pip install ragas datasets",
+            "documentation": "https://docs.ragas.io/"
+        }
+    
+    return {
+        "enabled": True,
+        "metrics_available": [
+            "faithfulness",
+            "answer_relevancy",
+            "context_precision",
+            "context_recall"
+        ],
+        "metrics_description": {
+            "faithfulness": "Measures if answer is grounded in given context (0-1)",
+            "answer_relevancy": "Measures if answer addresses the question (0-1)",
+            "context_precision": "Measures if retrieved contexts are relevant (0-1)",
+            "context_recall": "Measures if all relevant info is retrieved (0-1, needs ground_truth)"
+        },
+        "llm_configured": ragas_llm is not None,
+        "embeddings_configured": ragas_embeddings is not None,
+        "status": "operational" if (ragas_llm and ragas_embeddings) else "partially_configured"
+    }
+
+@app.post("/evaluate")
+def evaluate_single_query(
+    question: str = Query(..., description="Question to evaluate"),
+    ground_truth: str | None = Query(None, description="Reference answer for comparison"),
+    top_k: int = Query(5, description="Number of contexts to retrieve")
+):
+    """
+    Evaluate a single RAG query using RAGAs metrics.
+    
+    This endpoint:
+    1. Retrieves contexts for the question
+    2. Generates an answer using the RAG pipeline
+    3. Evaluates using RAGAs metrics
+    4. Returns scores and detailed results
+    
+    Metrics:
+    - faithfulness: Answer grounded in context?
+    - answer_relevancy: Answer addresses question?
+    - context_precision: Retrieved docs are relevant?
+    - context_recall: All relevant info retrieved? (needs ground_truth)
+    """
+    if not _HAS_RAGAS:
+        raise HTTPException(503, "RAGAs evaluation framework is not available. Install with: pip install ragas datasets")
+    
+    if not (ragas_llm and ragas_embeddings):
+        raise HTTPException(503, "RAGAs evaluators not properly configured")
+    
+    print(f"[RAGAs Evaluate] Question: {question}")
+    
+    # Step 1: Retrieve contexts
+    retriever = VectorIndexRetriever(
+        index=index,
+        similarity_top_k=top_k * 2,  # Over-fetch for re-ranking
+    )
+    
+    nodes = retriever.retrieve(question)
+    print(f"[RAGAs Evaluate] Retrieved {len(nodes)} candidates")
+    
+    # Step 2: Re-rank
+    try:
+        reranked_nodes = reranker.postprocess_nodes(
+            nodes=nodes,
+            query_str=question,
+        )
+        print(f"[RAGAs Evaluate] Re-ranked to {len(reranked_nodes)} nodes")
+    except Exception as e:
+        print(f"[RAGAs Evaluate] Re-ranking failed: {e}, using original nodes")
+        reranked_nodes = nodes[:top_k]
+    
+    # Step 3: Extract contexts
+    contexts = [node.text for node in reranked_nodes[:top_k]]
+    
+    # Step 4: Generate answer
+    context_text = "\n\n".join([
+        f"Context {i+1}: {node.text[:800]}" 
+        for i, node in enumerate(reranked_nodes[:top_k])
+    ])
+    
+    from llama_index.core.llms import ChatMessage as LLMChatMsg
+    
+    prompt = f"""Context from documents:
+{context_text}
+
+Question: {question}
+
+Please provide a clear, accurate answer based ONLY on the information in the context above. Include specific details."""
+    
+    response = llm.chat([
+        LLMChatMsg(role="system", content="You are a precise document analyst. Extract EXACT information from documents."),
+        LLMChatMsg(role="user", content=prompt)
+    ])
+    
+    answer = str(response.message.content)
+    print(f"[RAGAs Evaluate] Generated answer: {answer[:100]}...")
+    
+    # Step 5: Evaluate with RAGAs
+    print("[RAGAs Evaluate] Running evaluation metrics...")
+    metrics = evaluate_rag_response(
+        question=question,
+        answer=answer,
+        contexts=contexts,
+        ground_truth=ground_truth
+    )
+    
+    print(f"[RAGAs Evaluate] Evaluation complete. Scores: {metrics}")
+    
+    # Step 6: Return results
+    return {
+        "question": question,
+        "answer": answer,
+        "contexts": contexts,
+        "ground_truth": ground_truth,
+        "num_contexts": len(contexts),
+        "metrics": metrics,
+        "sources": [
+            {
+                "index": i + 1,
+                "source": node.metadata.get("source", "unknown"),
+                "score": float(node.score if hasattr(node, 'score') else 0.0),
+                "text_preview": node.text[:200] + "..."
+            }
+            for i, node in enumerate(reranked_nodes[:top_k])
+        ],
+        "evaluation_summary": {
+            "total_metrics": len(metrics),
+            "average_score": sum(v for k, v in metrics.items() if isinstance(v, (int, float))) / len([v for k, v in metrics.items() if isinstance(v, (int, float))]) if any(isinstance(v, (int, float)) for v in metrics.values()) else 0.0,
+            "has_errors": "error" in metrics
+        }
+    }
+
+@app.post("/evaluate/batch")
+def evaluate_batch(body: EvaluateRequest):
+    """
+    Evaluate multiple queries in batch using RAGAs.
+    
+    Useful for testing and benchmarking your RAG system.
+    
+    This endpoint processes multiple questions, generates answers,
+    and evaluates them using RAGAs metrics. Returns individual
+    scores for each question plus aggregate statistics.
+    """
+    if not _HAS_RAGAS:
+        raise HTTPException(503, "RAGAs evaluation framework is not available")
+    
+    if not (ragas_llm and ragas_embeddings):
+        raise HTTPException(503, "RAGAs evaluators not properly configured")
+    
+    questions = body.questions
+    ground_truths = body.ground_truths or [None] * len(questions)
+    top_k = body.top_k or 5
+    
+    if body.ground_truths and len(body.ground_truths) != len(questions):
+        raise HTTPException(400, "Number of ground truths must match number of questions")
+    
+    print(f"[RAGAs Batch] Evaluating {len(questions)} questions")
+    
+    results = []
+    all_data = {
+        "question": [],
+        "answer": [],
+        "contexts": [],
+        "ground_truth": []
+    }
+    
+    # Process each question
+    for i, (question, ground_truth) in enumerate(zip(questions, ground_truths)):
+        print(f"[RAGAs Batch] Processing {i+1}/{len(questions)}: {question}")
+        
+        try:
+            # Retrieve and generate answer
+            retriever = VectorIndexRetriever(index=index, similarity_top_k=top_k * 2)
+            nodes = retriever.retrieve(question)
+            
+            try:
+                reranked_nodes = reranker.postprocess_nodes(nodes=nodes, query_str=question)
+            except:
+                reranked_nodes = nodes[:top_k]
+            
+            contexts = [node.text for node in reranked_nodes[:top_k]]
+            
+            # Generate answer
+            context_text = "\n\n".join([
+                f"Context {j+1}: {node.text[:800]}" 
+                for j, node in enumerate(reranked_nodes[:top_k])
+            ])
+            
+            from llama_index.core.llms import ChatMessage as LLMChatMsg
+            prompt = f"Context:\n{context_text}\n\nQuestion: {question}\n\nAnswer based on context:"
+            response = llm.chat([
+                LLMChatMsg(role="system", content="Extract information from context."),
+                LLMChatMsg(role="user", content=prompt)
+            ])
+            answer = str(response.message.content)
+            
+            # Store data
+            all_data["question"].append(question)
+            all_data["answer"].append(answer)
+            all_data["contexts"].append(contexts)
+            all_data["ground_truth"].append(ground_truth or "")
+            
+            results.append({
+                "question": question,
+                "answer": answer,
+                "contexts": contexts,
+                "ground_truth": ground_truth,
+                "num_contexts": len(contexts)
+            })
+            
+        except Exception as e:
+            print(f"[RAGAs Batch] Error processing question {i+1}: {e}")
+            results.append({
+                "question": question,
+                "answer": "",
+                "contexts": [],
+                "ground_truth": ground_truth,
+                "error": str(e)
+            })
+    
+    # Run batch evaluation
+    print("[RAGAs Batch] Running batch evaluation...")
+    dataset = Dataset.from_dict(all_data)
+    
+    metrics_list = [faithfulness, answer_relevancy, context_precision]
+    if any(ground_truths):
+        metrics_list.append(context_recall)
+    
+    try:
+        eval_result = evaluate(
+            dataset=dataset,
+            metrics=metrics_list,
+            llm=ragas_llm,
+            embeddings=ragas_embeddings,
+        )
+        
+        # Add scores to results
+        for i, result in enumerate(results):
+            if "error" not in result:
+                result["metrics"] = {}
+                for metric_name, metric_values in eval_result.items():
+                    if isinstance(metric_values, (list, tuple)) and i < len(metric_values):
+                        result["metrics"][metric_name] = float(metric_values[i])
+        
+        # Calculate averages
+        avg_metrics = {}
+        for metric_name in eval_result.keys():
+            values = eval_result[metric_name]
+            if isinstance(values, (list, tuple)):
+                valid_values = [v for v in values if isinstance(v, (int, float)) and not (isinstance(v, float) and (v != v))]  # Filter NaN
+                if valid_values:
+                    avg_metrics[f"avg_{metric_name}"] = float(sum(valid_values) / len(valid_values))
+        
+        evaluation_success = True
+        
+    except Exception as e:
+        print(f"[RAGAs Batch] Batch evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        avg_metrics = {"error": str(e)}
+        evaluation_success = False
+    
+    return {
+        "total_questions": len(questions),
+        "successful_evaluations": len([r for r in results if "error" not in r]),
+        "failed_evaluations": len([r for r in results if "error" in r]),
+        "results": results,
+        "average_metrics": avg_metrics,
+        "evaluation_success": evaluation_success
     }
 
 if __name__ == "__main__":

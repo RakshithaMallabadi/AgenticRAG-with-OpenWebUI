@@ -4,11 +4,12 @@ ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# system deps for healthcheck and docling (libGL for OpenCV)
+# system deps for healthcheck, docling (libGL for OpenCV), and git for RAGAs
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     libgl1 \
     libglib2.0-0 \
+    git \
  && rm -rf /var/lib/apt/lists/*
 
 # deps
