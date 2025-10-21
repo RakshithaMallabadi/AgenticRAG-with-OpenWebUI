@@ -1,0 +1,49 @@
+# Core FastAPI and web
+fastapi
+uvicorn[standard]
+python-dotenv
+
+# LlamaIndex core
+llama-index>=0.12.0
+llama-index-vector-stores-postgres
+llama-index-embeddings-huggingface
+llama-index-llms-ollama
+llama-index-postprocessor-cohere-rerank
+cohere
+
+# Memory and chat
+redis
+llama-index-storage-chat-store-redis
+
+# Database
+psycopg2-binary
+sqlalchemy
+pgvector
+
+# Embeddings
+sentence-transformers
+
+# CrewAI
+crewai
+
+# Document processing
+docling==2.57.0
+docling-core==2.49.0
+docling-parse==4.7.0
+docling-ibm-models==3.10.0
+
+# Utilities
+httpx
+pydantic
+
+# Arize Phoenix - Observability and Tracing
+arize-phoenix>=4.0.0
+openinference-instrumentation-llama-index
+openinference-instrumentation-crewai
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+
+# RAGAs - Evaluation Framework
+ragas>=0.1.0
+datasets>=2.14.0
+
