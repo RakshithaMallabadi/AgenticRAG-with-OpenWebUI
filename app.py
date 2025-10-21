@@ -379,14 +379,14 @@ def add_contextual_metadata(documents: List[Document]) -> List[Document]:
 # ---------- Ingestion Function ----------
 def ingest_documents(folder: Path = DATA_DIR, patterns: tuple = ("*.txt", "*.md", "*.pdf")):
     """Ingest documents using LlamaIndex with contextual enhancement"""
-        folder = Path(folder).resolve()
+    folder = Path(folder).resolve()
     files = []
-        for pat in patterns:
-            files.extend(sorted(folder.rglob(pat)))
+    for pat in patterns:
+        files.extend(sorted(folder.rglob(pat)))
 
     documents = []
-        for p in files:
-            try:
+    for p in files:
+        try:
             text = _read_text_from_path(p)
             if not text or not text.strip():
                 continue
@@ -402,12 +402,12 @@ def ingest_documents(folder: Path = DATA_DIR, patterns: tuple = ("*.txt", "*.md"
             )
             documents.append(doc)
             print(f"[Ingest] Added document: {p.name}")
-            except Exception as e:
-                print(f"[ingest] skip {p}: {e}")
-                continue
+        except Exception as e:
+            print(f"[ingest] skip {p}: {e}")
+            continue
 
     if not documents:
-            return 0, [str(p) for p in files]
+        return 0, [str(p) for p in files]
 
     # Add contextual metadata (Anthropic-style)
     print(f"[Contextual RAG] Adding contextual metadata to {len(documents)} documents")
@@ -435,6 +435,7 @@ def ingest_documents(folder: Path = DATA_DIR, patterns: tuple = ("*.txt", "*.md"
     return len(nodes), [str(p) for p in files]
 
 # ---------- CrewAI Agents ----------
+# ---------- CrewAI Agents ----------
 # Set environment variables for CrewAI
 os.environ.setdefault("OLLAMA_API_BASE", OLLAMA_BASE)
 
@@ -443,25 +444,26 @@ rag_agent = None
 if llm is not None:
     try:
         # Legacy single agent (kept for compatibility)
-rag_agent = Agent(
-    role="RAG Answerer",
-    goal=(
-        "Answer the user's question using ONLY the provided context chunks. "
-        "Cite sources as [filename#chunk-N]. If context is insufficient, say so explicitly."
-    ),
-    backstory=(
-        "You are a careful analyst. You never invent facts. You keep answers concise "
-        "and always include exact sources from the provided context."
-    ),
+        rag_agent = Agent(
+            role="RAG Answerer",
+            goal=(
+                "Answer the user's question using ONLY the provided context chunks. "
+                "Cite sources as [filename#chunk-N]. If context is insufficient, say so explicitly."
+            ),
+            backstory=(
+                "You are a careful analyst. You never invent facts. You keep answers concise "
+                "and always include exact sources from the provided context."
+            ),
             llm=llm,
-    verbose=False,
-)
+            verbose=False,
+        )
         print("[CrewAI] Single agent initialized successfully")
     except Exception as e:
         print(f"[CrewAI] Failed to initialize single agent: {e}")
         rag_agent = None
 else:
     print("[CrewAI] LLM not available, skipping agent initialization")
+
 
 # ---------- Multi-Agent CrewAI System ----------
 
