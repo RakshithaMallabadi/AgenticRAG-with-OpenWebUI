@@ -219,7 +219,7 @@ if _HAS_COHERE and os.getenv("COHERE_API_KEY"):
     )
 else:
     print("[Rerank] Using similarity-based re-ranker")
-    reranker = SimilarityPostprocessor(similarity_cutoff=0.3)
+    reranker = SimilarityPostprocessor(similarity_cutoff=0.1)  # Lowered from 0.3 to allow more results
 
 # Response synthesizer for contextual answers
 response_synthesizer = get_response_synthesizer(
@@ -849,25 +849,55 @@ def chat_with_memory(body: AskRequest):
     context_parts = []
     citations = []
     
+    # Filter nodes by minimum relevance threshold
+    min_relevance_threshold = 0.25  # Only include nodes with relevance > 0.25 (balanced threshold)
+    filtered_nodes = []
+    
     for i, node in enumerate(reranked_nodes[:body.top_k or 5]):
         source = node.metadata.get("source", "unknown")
         file_path = node.metadata.get("file_path", "")
         score = node.score if hasattr(node, 'score') else 0.0
         
-        citation = {
-            "index": i + 1,
-            "source": source,
-            "file_path": file_path,
-            "score": float(score),
-            "text_preview": node.text[:200] + "..." if len(node.text) > 200 else node.text
-        }
-        citations.append(citation)
-        
-        context_parts.append(
-            f"[{i+1}] Source: {source} (Score: {score:.3f})\n{node.text}\n"
-        )
+        # Only include nodes above relevance threshold
+        if score >= min_relevance_threshold:
+            filtered_nodes.append(node)
+            
+            # Create citation
+            citation = {
+                "index": len(citations) + 1,
+                "source": source,
+                "file_path": file_path,
+                "score": float(score),
+                "text_preview": node.text[:200] + "..." if len(node.text) > 200 else node.text
+            }
+            citations.append(citation)
+            
+            # Format context part
+            context_parts.append(
+                f"[{len(citations)}] Source: {source} (Score: {score:.3f})\n{node.text}\n"
+            )
     
     context_text = "\n\n".join(context_parts) if context_parts else "No documents found."
+    
+    # Check if we have sufficient relevant content
+    if not filtered_nodes:
+        answer = "I don't have sufficient relevant information in the knowledge base to answer this question."
+        # Update memory with the "no information" response
+        memory.put(LLMChatMessage(role=MessageRole.USER, content=question))
+        memory.put(LLMChatMessage(role=MessageRole.ASSISTANT, content=answer))
+        
+        return {
+            "answer": answer,
+            "context": "No relevant documents found above the relevance threshold.",
+            "retrieved_nodes": 0,
+            "citations": [],
+            "reranked": True,
+            "reranker_type": "cohere" if _HAS_COHERE and os.getenv("COHERE_API_KEY") else "similarity",
+            "session_id": session_id,
+            "conversation_length": len(memory.get_all()),
+            "is_new_session": len(chat_history) == 0,
+            "confidence": "low"
+        }
     
     # Step 5: Generate conversational answer using LLM
     if context_parts:
@@ -898,19 +928,31 @@ Please provide a clear, accurate answer based ONLY on the information in the con
             from llama_index.core.llms import ChatMessage as LLMChatMsg
             
             response = llm.chat([
-                LLMChatMsg(role="system", content="You are a precise document analyst. Extract EXACT information from documents:\n• Include full names with titles (H.E., Dr., etc.)\n• Include complete organization names\n• Include specific dates, numbers, and roles\n• Quote directly from source when possible\n• Never generalize if specific details exist in the context"),
+                LLMChatMsg(role="system", content="""You are a precise document analyst. RULES:
+• Answer the question using ONLY the information explicitly present in the provided context
+• Extract and present specific details like names, dates, terms, and definitions
+• If the EXACT terms aren't found but RELATED information exists, explain what IS available
+• Only say "I don't have sufficient information" if NO related information is found
+• Be helpful - if you find relevant information, share it even if it uses different terminology
+• Include full names with titles, organization names, dates, numbers, and roles when present
+• Quote directly from source when possible
+• NEVER make up information not in the context"""),
                 LLMChatMsg(role="user", content=prompt)
             ])
             
             llm_answer = str(response.message.content)
             
-            # Add source citations
-            citations_text = "\n\n**Sources:**\n" + "\n".join([
-                f"[{i+1}] {node.metadata.get('source', 'unknown')} (relevance: {node.score if hasattr(node, 'score') else 0.0:.2f})"
-                for i, node in enumerate(reranked_nodes[:body.top_k or 5])
-            ])
-            
-            answer = llm_answer + citations_text
+            # Validate response - only block if clearly stating no information at the start
+            if llm_answer.strip().startswith("I don't have sufficient information"):
+                # If LLM clearly says no information, don't add sources
+                answer = "I don't have sufficient information in the provided documents to answer this question."
+            else:
+                # Add source citations for all other responses
+                citations_text = "\n\n**Sources:**\n" + "\n".join([
+                    f"[{i+1}] {node.metadata.get('source', 'unknown')} (relevance: {node.score if hasattr(node, 'score') else 0.0:.2f})"
+                    for i, node in enumerate(filtered_nodes)
+                ])
+                answer = llm_answer + citations_text
             
         except Exception as e:
             print(f"[Chat] LLM generation failed: {e}, returning context-based answer")
@@ -919,7 +961,7 @@ Please provide a clear, accurate answer based ONLY on the information in the con
 
 {context_text}
 ---
-Retrieved {len(reranked_nodes)} contextually-enhanced chunks."""
+Retrieved {len(filtered_nodes)} contextually-enhanced chunks."""
     else:
         answer = "No relevant information found in the knowledge base for your question."
     
@@ -931,13 +973,14 @@ Retrieved {len(reranked_nodes)} contextually-enhanced chunks."""
     return {
         "answer": answer,
         "context": context_text,
-        "retrieved_nodes": len(reranked_nodes),
+        "retrieved_nodes": len(filtered_nodes),
         "citations": citations,
         "reranked": True,
         "reranker_type": "cohere" if _HAS_COHERE and os.getenv("COHERE_API_KEY") else "similarity",
         "session_id": session_id,
         "conversation_length": len(memory.get_all()),
-        "is_new_session": len(chat_history) == 0
+        "is_new_session": len(chat_history) == 0,
+        "confidence": "high" if len(filtered_nodes) >= 2 else "medium"
     }
 
 @app.post("/ask")
@@ -955,6 +998,11 @@ def ask(body: AskRequest):
     question = (body.question or "").strip()
     if not question:
         raise HTTPException(400, "question is required")
+    
+    # Check if question is asking for specific terms/concepts that might not exist
+    specific_terms = ["delivery terms", "payment terms", "intellectual property", "disciplinary actions", "penalty clauses"]
+    question_lower = question.lower()
+    asking_for_specific_terms = any(term in question_lower for term in specific_terms)
 
     # Step 1: Retrieve initial candidates (over-fetch for re-ranking)
     initial_top_k = (body.top_k or 5) * 2  # Fetch 2x for re-ranking
@@ -982,27 +1030,50 @@ def ask(body: AskRequest):
     context_parts = []
     citations = []
     
+    # Filter nodes by minimum relevance threshold
+    min_relevance_threshold = 0.25  # Only include nodes with relevance > 0.25 (balanced threshold)
+    filtered_nodes = []
+    
     for i, node in enumerate(reranked_nodes[:body.top_k or 5]):
         source = node.metadata.get("source", "unknown")
         file_path = node.metadata.get("file_path", "")
         score = node.score if hasattr(node, 'score') else 0.0
         
-        # Create citation
-        citation = {
-            "index": i + 1,
-            "source": source,
-            "file_path": file_path,
-            "score": float(score),
-            "text_preview": node.text[:200] + "..." if len(node.text) > 200 else node.text
-        }
-        citations.append(citation)
-        
-        # Format context part
-        context_parts.append(
-            f"[{i+1}] Source: {source} (Score: {score:.3f})\n{node.text}\n"
-        )
+        # Only include nodes above relevance threshold
+        if score >= min_relevance_threshold:
+            filtered_nodes.append(node)
+            
+            # Create citation
+            citation = {
+                "index": len(citations) + 1,
+                "source": source,
+                "file_path": file_path,
+                "score": float(score),
+                "text_preview": node.text[:200] + "..." if len(node.text) > 200 else node.text
+            }
+            citations.append(citation)
+            
+            # Format context part
+            context_parts.append(
+                f"[{len(citations)}] Source: {source} (Score: {score:.3f})\n{node.text}\n"
+            )
     
     context_text = "\n\n".join(context_parts) if context_parts else "No documents found."
+    
+    # Check if we have sufficient relevant content
+    if not filtered_nodes:
+        return {
+            "answer": "I don't have sufficient relevant information in the knowledge base to answer this question.",
+            "context": "No relevant documents found above the relevance threshold.",
+            "retrieved_nodes": 0,
+            "citations": [],
+            "reranked": True,
+            "reranker_type": "cohere" if _HAS_COHERE and os.getenv("COHERE_API_KEY") else "similarity",
+            "confidence": "low"
+        }
+    
+    # For specific terms, check if we have at least some relevant context
+    # Removed overly strict 0.7 threshold that was blocking valid responses
     
     # Step 4: Generate contextual answer
     if context_parts:
@@ -1011,7 +1082,7 @@ def ask(body: AskRequest):
 {context_text}
 
 ---
-Retrieved {len(reranked_nodes)} contextually-enhanced chunks with citations above.
+Retrieved {len(filtered_nodes)} contextually-enhanced chunks with citations above.
 Use the [number] references to cite specific sources."""
     else:
         answer = "No relevant information found in the knowledge base."
@@ -1019,10 +1090,11 @@ Use the [number] references to cite specific sources."""
     return {
         "answer": answer,
         "context": context_text,
-        "retrieved_nodes": len(reranked_nodes),
+        "retrieved_nodes": len(filtered_nodes),
         "citations": citations,
         "reranked": True,
-        "reranker_type": "cohere" if _HAS_COHERE and os.getenv("COHERE_API_KEY") else "similarity"
+        "reranker_type": "cohere" if _HAS_COHERE and os.getenv("COHERE_API_KEY") else "similarity",
+        "confidence": "high" if len(filtered_nodes) >= 2 else "medium"
     }
 
 @app.post("/ask-crewai")
@@ -1279,16 +1351,31 @@ Question: {question}
 Please provide a clear, accurate answer based ONLY on the information in the context above."""
                 
                 response = llm.chat([
-                    LLMChatMsg(role="system", content="You are a precise document analyst. Extract EXACT information from documents."),
+                    LLMChatMsg(role="system", content="""You are a precise document analyst. RULES:
+• Answer the question using ONLY the information explicitly present in the provided context
+• Extract and present specific details like names, dates, terms, and definitions
+• If the EXACT terms aren't found but RELATED information exists, explain what IS available
+• Only say "I don't have sufficient information" if NO related information is found
+• Be helpful - if you find relevant information, share it even if it uses different terminology
+• Include full names with titles, organization names, dates, numbers, and roles when present
+• Quote directly from source when possible
+• NEVER make up information not in the context"""),
                     LLMChatMsg(role="user", content=prompt)
                 ])
                 
                 llm_answer = str(response.message.content)
-                citations_text = "\n\n**Sources:**\n" + "\n".join([
-                    f"[{i+1}] {node.metadata.get('source', 'unknown')} (relevance: {node.score if hasattr(node, 'score') else 0.0:.2f})"
-                    for i, node in enumerate(reranked_nodes[:5])
-                ])
-                answer = llm_answer + citations_text
+                
+                # Validate response - only block if clearly stating no information at the start
+                if llm_answer.strip().startswith("I don't have sufficient information"):
+                    # If LLM clearly says no information, don't add sources
+                    answer = "I don't have sufficient information in the provided documents to answer this question."
+                else:
+                    # Add source citations for all other responses
+                    citations_text = "\n\n**Sources:**\n" + "\n".join([
+                        f"[{i+1}] {node.metadata.get('source', 'unknown')} (relevance: {node.score if hasattr(node, 'score') else 0.0:.2f})"
+                        for i, node in enumerate(reranked_nodes[:5])
+                    ])
+                    answer = llm_answer + citations_text
                 
             except Exception as e2:
                 print(f"[OpenWebUI] Fallback LLM also failed: {e2}, returning context")
