@@ -28,6 +28,7 @@ jobs:
           ECR_REGISTRY: 458452735476.dkr.ecr.ap-southeast-2.amazonaws.com
           ECR_REPOSITORY: agenticrag-backend
           IMAGE_TAG: latest
+          AWS_REGION: us-east-1
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
