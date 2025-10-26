@@ -490,5 +490,3 @@ For questions or support, please open an issue on GitHub.
 ---
 
 **Built with ❤️ using LlamaIndex, CrewAI, and OpenWebUI**
-
-
