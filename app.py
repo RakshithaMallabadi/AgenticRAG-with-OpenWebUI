@@ -182,8 +182,17 @@ if _HAS_PHOENIX:
         
         # Instrument LlamaIndex with Phoenix tracing
         LlamaIndexInstrumentor().instrument(tracer_provider=tracer_provider)
+        print("[Phoenix] ✅ LlamaIndex instrumentation enabled")
         
-        print("[Phoenix] ✅ Phoenix tracing enabled for LlamaIndex")
+        # Instrument CrewAI with Phoenix tracing
+        try:
+            from openinference.instrumentation.crewai import CrewAIInstrumentor
+            CrewAIInstrumentor().instrument(tracer_provider=tracer_provider)
+            print("[Phoenix] ✅ CrewAI instrumentation enabled")
+        except Exception as e:
+            print(f"[Phoenix] ⚠️  CrewAI instrumentation failed: {e}")
+        
+        print("[Phoenix] ✅ Phoenix tracing enabled")
         print(f"[Phoenix] 🌐 Phoenix UI available at: http://localhost:6006")
         
     except Exception as e:
