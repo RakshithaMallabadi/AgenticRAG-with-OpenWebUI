@@ -9,6 +9,7 @@ A production-ready Retrieval-Augmented Generation (RAG) system with multi-agent 
 
 ## 🌟 Features
 
+
 - **🤖 Advanced RAG Pipeline** - Contextual retrieval with Anthropic-style enhancement
 - **🔄 Re-ranking** - Cohere rerank-english-v3.0 with similarity-based fallback
 - **👥 Multi-Agent System** - CrewAI orchestration with specialized agents
