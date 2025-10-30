@@ -26,7 +26,7 @@ jobs:
       - name: Build, tag, and push image to Amazon ECR
         env:
           ECR_REGISTRY: 458452735476.dkr.ecr.us-east-1.amazonaws.com   # ✅ Updated region
-          ECR_REPOSITORY: agenticrag-backend
+          ECR_REPOSITORY: fastapi-backend
           IMAGE_TAG: latest
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
